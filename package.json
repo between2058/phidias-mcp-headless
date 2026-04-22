@@ -1,0 +1,27 @@
+{
+  "name": "phidias-mcp-headless",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Headless Phidias MCP server — text/image to 3D asset pipeline exposed as MCP tools for Claude Code. No browser frontend required.",
+  "bin": {
+    "phidias-mcp-headless": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
