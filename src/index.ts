@@ -21,6 +21,7 @@ import {
   segment3D,
   getSessionAssets,
   getOutputDir,
+  findAssetById,
 } from './phidias-client.js';
 import { serveFileIfMatch } from './file-serving.js';
 import { buildPublicUrlBase, requestContext, makeFileUrl } from './request-context.js';
@@ -188,6 +189,49 @@ If the user hasn't specified which backend to use, ask them. Returns the file pa
           isError: true,
         };
       }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Tool: download_asset
+  // -------------------------------------------------------------------------
+
+  server.tool(
+    'download_asset',
+    'Retrieve a previously generated asset by its asset ID. For images, returns the image inline so Claude can see (and save) it. For 3D models, returns a download URL (HTTP mode) or local path (stdio mode) that the client can fetch.',
+    {
+      asset_id: z.string().describe('Asset ID from list_generated_assets or a previous generation tool, e.g. "img_1776913747916".'),
+    },
+    async ({ asset_id }) => {
+      const asset = findAssetById(asset_id);
+      if (!asset) {
+        return {
+          content: [{ type: 'text' as const, text: `Asset not found: ${asset_id}. Use list_generated_assets to see available assets.` }],
+          isError: true,
+        };
+      }
+
+      if (asset.type === 'image') {
+        const base64 = fs.readFileSync(asset.filePath).toString('base64');
+        const textLines = [`Asset ${asset.id} (image)`, `File: ${asset.filePath}`];
+        const url = makeFileUrl(asset.filePath);
+        if (url) textLines.push(`URL: ${url}`);
+        return {
+          content: [
+            { type: 'image' as const, data: base64, mimeType: 'image/png' },
+            { type: 'text' as const, text: textLines.join('\n') },
+          ],
+        };
+      }
+
+      // 3D model
+      const lines = [`Asset ${asset.id} (3d model)`, `File: ${asset.filePath}`];
+      const url = makeFileUrl(asset.filePath);
+      if (url) lines.push(`Download: ${url}`);
+      else lines.push('Stdio mode — the client is on the same machine; read from File path directly.');
+      return {
+        content: [{ type: 'text' as const, text: lines.join('\n') }],
+      };
     },
   );
 
