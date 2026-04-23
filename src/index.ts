@@ -122,19 +122,18 @@ If the user hasn't specified which backend to use, ask them. Returns the file pa
           slat_sampling_steps: params.slat_sampling_steps,
         });
 
+        const lines: string[] = [
+          `3D model generated successfully (${params.backend}).`,
+          '',
+          `File: ${asset.filePath}`,
+        ];
+        const url = makeFileUrl(asset.filePath);
+        if (url) lines.push(`URL: ${url}`);
+        lines.push(`Source image: ${asset.sourceImagePath}`);
+        lines.push(`Asset ID: ${asset.id}`);
+
         return {
-          content: [
-            {
-              type: 'text' as const,
-              text: [
-                `3D model generated successfully (${params.backend}).`,
-                ``,
-                `File: ${asset.filePath}`,
-                `Source image: ${asset.sourceImagePath}`,
-                `Asset ID: ${asset.id}`,
-              ].join('\n'),
-            },
-          ],
+          content: [{ type: 'text' as const, text: lines.join('\n') }],
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -169,17 +168,18 @@ If the user hasn't specified which backend to use, ask them. Returns the file pa
           seed: params.seed,
         });
 
+        const lines: string[] = [
+          `Model segmented successfully into ${result.numParts} parts.`,
+          '',
+          `File: ${result.filePath}`,
+        ];
+        const url = makeFileUrl(result.filePath);
+        if (url) lines.push(`URL: ${url}`);
+        lines.push(`Parts: ${result.numParts}`);
+        lines.push(`Source: ${params.glb_path}`);
+
         return {
-          content: [{
-            type: 'text' as const,
-            text: [
-              `Model segmented successfully into ${result.numParts} parts.`,
-              ``,
-              `File: ${result.filePath}`,
-              `Parts: ${result.numParts}`,
-              `Source: ${params.glb_path}`,
-            ].join('\n'),
-          }],
+          content: [{ type: 'text' as const, text: lines.join('\n') }],
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
