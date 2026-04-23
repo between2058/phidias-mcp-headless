@@ -47,6 +47,10 @@ export function findAssetById(id: string): GeneratedAsset | undefined {
   return sessionAssets.find((a) => a.id === id);
 }
 
+export function trackSessionAsset(asset: GeneratedAsset): void {
+  sessionAssets.push(asset);
+}
+
 export function getOutputDir(): string {
   return OUTPUT_DIR;
 }

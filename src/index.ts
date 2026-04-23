@@ -23,7 +23,8 @@ import {
   getOutputDir,
   findAssetById,
 } from './phidias-client.js';
-import { inspectGltf } from './inspect-gltf.js';
+import { inspectGltf } from './inspect-model.js';
+import { applyPartNames } from './apply-part-names.js';
 import { serveFileIfMatch } from './file-serving.js';
 import { buildPublicUrlBase, requestContext, makeFileUrl } from './request-context.js';
 
@@ -194,16 +195,16 @@ If the user hasn't specified which backend to use, ask them. Returns the file pa
   );
 
   // -------------------------------------------------------------------------
-  // Tool: inspect_gltf
+  // Tool: inspect_model
   // -------------------------------------------------------------------------
 
   server.tool(
-    'inspect_gltf',
+    'inspect_model',
     `Inspect the structure of a GLB/glTF file and return it as JSON. Reports every node's world-space bounding box, centroid, size, face count, mesh/material indices, and parent/child relationships, plus scene-level totals and material base colors.
 
 Use this BEFORE trying to rename or regroup segmented parts. Spatial clues (centroid position, bbox size, which nodes share a parent) often let you name most parts from structure alone — e.g., the node with the largest Y-extent is probably the frame, the many small thin nodes stacked along Y are rack units, etc.
 
-No rendering is performed; this is pure scene-graph introspection and returns quickly.`,
+No rendering is performed; this is pure scene-graph introspection and returns quickly. Node indices reported here are stable and can be passed to apply_part_names to rename / regroup nodes.`,
     {
       glb_path: z.string().describe('Absolute path to a GLB (or glTF) file to inspect.'),
       max_nodes: z.number().int().min(1).max(10000).optional().describe('If the file has more nodes than this, the response truncates the `nodes` array to save context. Default: 500.'),
@@ -237,6 +238,74 @@ No rendering is performed; this is pure scene-graph introspection and returns qu
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: 'text' as const, text: `Error inspecting GLB: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Tool: apply_part_names
+  // -------------------------------------------------------------------------
+
+  server.tool(
+    'apply_part_names',
+    `Rename nodes and/or wrap groups of nodes under new parent nodes in a GLB, producing a NEW file (the source is never modified).
+
+Node indices match the order returned by inspect_model. Call inspect_model first to see what indices exist, decide names / groupings from spatial structure, then call this tool once with the resulting map.
+
+Grouping: each entry in \`groups\` creates a new parent node with the given name and moves the listed members to become its children. If all members share the same original parent, the new group is attached there; otherwise it is attached to the scene root and a warning is emitted. A node can belong to only one group per call.
+
+Returns the output GLB path + URL and an asset_id that can be passed to download_asset.`,
+    {
+      glb_path: z.string().describe('Absolute path to the source GLB.'),
+      names: z
+        .record(z.string(), z.string())
+        .optional()
+        .describe('Map of node index (as string key) to new name. Example: {"1": "front_door", "2": "rack_unit_0"}. Nodes not listed keep their original names.'),
+      groups: z
+        .array(
+          z.object({
+            name: z.string().describe('Name of the new parent group node.'),
+            member_indices: z
+              .array(z.number().int().nonnegative())
+              .describe('Indices of nodes that become children of the group (reparented from their original location).'),
+          }),
+        )
+        .optional()
+        .describe('Optional list of grouping instructions. Each creates a new named parent Node above its listed members.'),
+    },
+    async (params) => {
+      try {
+        const result = await applyPartNames({
+          glb_path: params.glb_path,
+          names: params.names,
+          groups: params.groups,
+        });
+
+        const lines: string[] = [
+          'Part names applied successfully.',
+          '',
+          `File: ${result.output_path}`,
+        ];
+        const url = makeFileUrl(result.output_path);
+        if (url) lines.push(`URL: ${url}`);
+        lines.push(`Asset ID: ${result.asset_id}`);
+        lines.push(`Names applied: ${result.applied_names_count}`);
+        lines.push(`Groups applied: ${result.applied_groups_count}`);
+        lines.push(`Source: ${result.source}`);
+        if (result.warnings.length > 0) {
+          lines.push('', 'Warnings:');
+          for (const w of result.warnings) lines.push(`  - ${w}`);
+        }
+
+        return {
+          content: [{ type: 'text' as const, text: lines.join('\n') }],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: `Error applying part names: ${msg}` }],
           isError: true,
         };
       }
