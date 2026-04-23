@@ -217,8 +217,11 @@ If the user hasn't specified which backend to use, ask them. Returns the file pa
         const parts = [
           `${i + 1}. [${a.type.toUpperCase()}] ${a.filePath}`,
         ];
+        const url = makeFileUrl(a.filePath);
+        if (url) parts.push(`   URL: ${url}`);
         if (a.prompt) parts.push(`   Prompt: "${a.prompt}"`);
         if (a.sourceImagePath) parts.push(`   Source: ${a.sourceImagePath}`);
+        parts.push(`   Asset ID: ${a.id}`);
         parts.push(`   Created: ${a.createdAt}`);
         return parts.join('\n');
       });
