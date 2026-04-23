@@ -53,7 +53,14 @@ export function serveFileIfMatch(
     }
   }
 
-  const raw = decodeURIComponent(req.url.slice('/files/'.length));
+  let raw: string;
+  try {
+    raw = decodeURIComponent(req.url.slice('/files/'.length));
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.end('Bad request');
+    return true;
+  }
   const safeName = path.basename(raw);
   if (!safeName || safeName.startsWith('.') || safeName !== raw) {
     res.writeHead(404, { 'Content-Type': 'text/plain' });
@@ -74,6 +81,16 @@ export function serveFileIfMatch(
     'Content-Type': getMimeType(ext),
     'Content-Length': stat.size,
   });
-  fs.createReadStream(filePath).pipe(res);
+  const stream = fs.createReadStream(filePath);
+  stream.on('error', (err) => {
+    process.stderr.write(`[phidias-mcp] file stream error: ${err.message}\n`);
+    if (!res.headersSent) {
+      res.writeHead(500);
+      res.end();
+    } else {
+      res.destroy();
+    }
+  });
+  stream.pipe(res);
   return true;
 }
