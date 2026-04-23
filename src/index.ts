@@ -23,6 +23,7 @@ import {
   getOutputDir,
   findAssetById,
 } from './phidias-client.js';
+import { inspectGltf } from './inspect-gltf.js';
 import { serveFileIfMatch } from './file-serving.js';
 import { buildPublicUrlBase, requestContext, makeFileUrl } from './request-context.js';
 
@@ -186,6 +187,56 @@ If the user hasn't specified which backend to use, ask them. Returns the file pa
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: 'text' as const, text: `Error segmenting model: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Tool: inspect_gltf
+  // -------------------------------------------------------------------------
+
+  server.tool(
+    'inspect_gltf',
+    `Inspect the structure of a GLB/glTF file and return it as JSON. Reports every node's world-space bounding box, centroid, size, face count, mesh/material indices, and parent/child relationships, plus scene-level totals and material base colors.
+
+Use this BEFORE trying to rename or regroup segmented parts. Spatial clues (centroid position, bbox size, which nodes share a parent) often let you name most parts from structure alone — e.g., the node with the largest Y-extent is probably the frame, the many small thin nodes stacked along Y are rack units, etc.
+
+No rendering is performed; this is pure scene-graph introspection and returns quickly.`,
+    {
+      glb_path: z.string().describe('Absolute path to a GLB (or glTF) file to inspect.'),
+      max_nodes: z.number().int().min(1).max(10000).optional().describe('If the file has more nodes than this, the response truncates the `nodes` array to save context. Default: 500.'),
+    },
+    async ({ glb_path, max_nodes }) => {
+      try {
+        const result = await inspectGltf(glb_path);
+        const limit = max_nodes ?? 500;
+        const truncated = result.nodes.length > limit;
+        const payload = truncated
+          ? {
+              ...result,
+              nodes: result.nodes.slice(0, limit),
+              _truncated: {
+                shown: limit,
+                total: result.nodes.length,
+                note: `Response truncated to the first ${limit} nodes. Pass max_nodes to see more.`,
+              },
+            }
+          : result;
+
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify(payload, null, 2),
+            },
+          ],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: `Error inspecting GLB: ${msg}` }],
           isError: true,
         };
       }
