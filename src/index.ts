@@ -26,6 +26,10 @@ import {
 import { inspectGltf } from './inspect-model.js';
 import { applyPartNames } from './apply-part-names.js';
 import { mergeParts } from './merge-parts.js';
+import {
+  exportArticulation,
+  MATERIAL_PRESET_KEYS,
+} from './export-articulation.js';
 import { serveFileIfMatch } from './file-serving.js';
 import { buildPublicUrlBase, requestContext, makeFileUrl } from './request-context.js';
 
@@ -379,6 +383,113 @@ Call inspect_model first to see indices, then decide which clusters to merge. Ty
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: 'text' as const, text: `Error merging parts: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Tool: export_articulation
+  // -------------------------------------------------------------------------
+
+  server.tool(
+    'export_articulation',
+    `Export a physics-ready articulation (USDA or USDZ) from a GLB plus a description of its rigid bodies and joints. This replaces what a human user would do in the Phidias Physics tab: assign materials, set mass / collision / friction per part, lay out the joint topology, and click "export".
+
+Typical pipeline:
+  segment_model → inspect_model → (optional merge_parts) → apply_part_names
+                                                        → export_articulation
+
+Node indices from inspect_model are NOT used directly here — the backend identifies parts by string \`id\`. A natural convention is to use the node name (after apply_part_names) as the id, then the joint \`parent\` / \`child\` fields reference those ids.
+
+Material presets are expanded client-side. If a part has \`material_preset: "steel"\`, density / friction / restitution are filled from a preset table (see the enum in the schema). Explicit numeric fields override the preset.
+
+Returns the local path and URL of the produced USD file plus an asset_id usable with download_asset.`,
+    {
+      glb_path: z.string().describe('Absolute path to the GLB the articulation describes (typically the output of apply_part_names or merge_parts).'),
+      model_name: z.string().min(1).describe('Name for the articulation root, used inside the USD output (e.g. "server_rack", "ur5_arm").'),
+      format: z.enum(['usda', 'usdz']).describe('USDA (text, external textures) or USDZ (zipped, self-contained).'),
+      parts: z
+        .array(
+          z.object({
+            id: z.string().describe('Unique part identifier. Joints reference this in parent/child.'),
+            name: z.string().describe('Human-readable display name.'),
+            type: z.enum(['link', 'base', 'tool', 'joint']).optional().describe('Semantic type. Exactly one part should usually be "base" (the fixed root).'),
+            role: z.enum(['actuator', 'support', 'gripper', 'sensor', 'other']).optional(),
+            mobility: z.enum(['fixed', 'revolute', 'prismatic']).optional().describe('How this body moves relative to its parent. Default "fixed".'),
+            mass: z.number().positive().nullable().optional().describe('Mass in kg. Leave null/omit to let the backend auto-compute from density × volume.'),
+            density: z.number().positive().optional().describe('kg/m³. Used to auto-compute mass when mass is null. Default 1000.'),
+            center_of_mass: z.tuple([z.number(), z.number(), z.number()]).nullable().optional().describe('Override the centre of mass in local coordinates.'),
+            collision_type: z.enum(['mesh', 'convexHull', 'convexDecomposition', 'none']).optional().describe('Default "convexHull".'),
+            static_friction: z.number().min(0).optional(),
+            dynamic_friction: z.number().min(0).optional(),
+            restitution: z.number().min(0).max(1).optional(),
+            material_preset: z
+              .enum(MATERIAL_PRESET_KEYS)
+              .optional()
+              .describe('Optional shortcut that fills density + frictions + restitution from a preset. Explicit numeric fields override this.'),
+          }),
+        )
+        .min(1)
+        .describe('Array of rigid bodies. Every joint reference must resolve to one of these ids.'),
+      joints: z
+        .array(
+          z.object({
+            name: z.string(),
+            parent: z.string().describe('Parent part id. Must match an entry in parts[].id.'),
+            child: z.string().describe('Child part id. Must match an entry in parts[].id.'),
+            type: z.enum(['fixed', 'revolute', 'prismatic']).optional().describe('Default "revolute".'),
+            axis: z.tuple([z.number(), z.number(), z.number()]).optional().describe('Axis of motion in world space. Need not be normalised. Default [0,0,1].'),
+            anchor: z.tuple([z.number(), z.number(), z.number()]).optional().describe('Pivot point relative to the child body. Default [0,0,0] (child origin). Useful to set to the world_centroid of the joint location.'),
+            lower_limit: z.number().nullable().optional().describe('Degrees for revolute, metres for prismatic. null = unlimited.'),
+            upper_limit: z.number().nullable().optional(),
+            drive_stiffness: z.number().min(0).nullable().optional(),
+            drive_damping: z.number().min(0).nullable().optional(),
+            drive_max_force: z.number().min(0).nullable().optional(),
+            drive_type: z.enum(['position', 'velocity', 'none']).optional(),
+            disable_collision: z.boolean().optional().describe('Disable collision between parent and child of this joint. Default true.'),
+          }),
+        )
+        .describe('Array of joints linking parts into a kinematic structure. Can be empty for a single rigid body.'),
+    },
+    async (params) => {
+      try {
+        const result = await exportArticulation({
+          glb_path: params.glb_path,
+          model_name: params.model_name,
+          parts: params.parts,
+          joints: params.joints,
+          format: params.format,
+        });
+
+        const lines: string[] = [
+          `Articulation exported successfully (${result.format.toUpperCase()}).`,
+          '',
+          `File: ${result.output_path}`,
+        ];
+        const url = makeFileUrl(result.output_path);
+        if (url) lines.push(`URL: ${url}`);
+        lines.push(`Asset ID: ${result.asset_id}`);
+        lines.push(`Backend filename: ${result.backend_filename}`);
+        lines.push(`Parts: ${result.parts_count}`);
+        lines.push(`Joints: ${result.joints_count}`);
+        if (result.presets_expanded > 0) {
+          lines.push(`Material presets expanded: ${result.presets_expanded}`);
+        }
+        lines.push(`Source GLB: ${result.source}`);
+        if (result.warnings.length > 0) {
+          lines.push('', 'Warnings:');
+          for (const w of result.warnings) lines.push(`  - ${w}`);
+        }
+
+        return {
+          content: [{ type: 'text' as const, text: lines.join('\n') }],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: `Error exporting articulation: ${msg}` }],
           isError: true,
         };
       }
