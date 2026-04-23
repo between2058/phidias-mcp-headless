@@ -21,6 +21,8 @@ import {
   getSessionAssets,
   getOutputDir,
 } from './phidias-client.js';
+import { serveFileIfMatch } from './file-serving.js';
+import { buildPublicUrlBase, requestContext } from './request-context.js';
 
 // ---------------------------------------------------------------------------
 // Server factory — each HTTP request in stateless mode gets a fresh server,
@@ -255,9 +257,12 @@ async function startHttp(port: number, host: string, token: string | undefined):
       return;
     }
 
+    // File retrieval (same auth posture as /mcp)
+    if (serveFileIfMatch(req, res, token)) return;
+
     if (!req.url || !req.url.startsWith('/mcp')) {
       res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end('Not found. MCP endpoint is at /mcp');
+      res.end('Not found. MCP endpoint is at /mcp, files at /files/<name>');
       return;
     }
 
@@ -279,17 +284,20 @@ async function startHttp(port: number, host: string, token: string | undefined):
       requestServer.close().catch(() => {});
     });
 
-    try {
-      await requestServer.connect(transport);
-      await transport.handleRequest(req, res);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`[phidias-mcp] handleRequest error: ${msg}\n`);
-      if (!res.headersSent) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: msg }));
+    const publicUrlBase = buildPublicUrlBase(req);
+    await requestContext.run({ publicUrlBase }, async () => {
+      try {
+        await requestServer.connect(transport);
+        await transport.handleRequest(req, res);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[phidias-mcp] handleRequest error: ${msg}\n`);
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: msg }));
+        }
       }
-    }
+    });
   });
 
   await new Promise<void>((resolve, reject) => {
