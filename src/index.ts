@@ -10,6 +10,7 @@
  */
 
 import http from 'node:http';
+import fs from 'node:fs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -22,7 +23,7 @@ import {
   getOutputDir,
 } from './phidias-client.js';
 import { serveFileIfMatch } from './file-serving.js';
-import { buildPublicUrlBase, requestContext } from './request-context.js';
+import { buildPublicUrlBase, requestContext, makeFileUrl } from './request-context.js';
 
 // ---------------------------------------------------------------------------
 // Server factory — each HTTP request in stateless mode gets a fresh server,
@@ -61,20 +62,22 @@ function createServer(): McpServer {
           aspect_ratio: params.aspect_ratio,
         });
 
+        const base64 = fs.readFileSync(asset.filePath).toString('base64');
+        const textLines: string[] = [
+          'Image generated successfully.',
+          '',
+          `File: ${asset.filePath}`,
+        ];
+        const url = makeFileUrl(asset.filePath);
+        if (url) textLines.push(`URL: ${url}`);
+        textLines.push(`Prompt: "${params.prompt}"`);
+        textLines.push(`Asset ID: ${asset.id}`);
+        textLines.push('', 'Next step: Use generate_3d with this image path or URL to create a 3D model.');
+
         return {
           content: [
-            {
-              type: 'text' as const,
-              text: [
-                `Image generated successfully.`,
-                ``,
-                `File: ${asset.filePath}`,
-                `Prompt: "${params.prompt}"`,
-                `Asset ID: ${asset.id}`,
-                ``,
-                `Next step: Use generate_3d with this image path to create a 3D model.`,
-              ].join('\n'),
-            },
+            { type: 'image' as const, data: base64, mimeType: 'image/png' },
+            { type: 'text' as const, text: textLines.join('\n') },
           ],
         };
       } catch (err) {
