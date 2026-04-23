@@ -25,6 +25,7 @@ import {
 } from './phidias-client.js';
 import { inspectGltf } from './inspect-model.js';
 import { applyPartNames } from './apply-part-names.js';
+import { mergeParts } from './merge-parts.js';
 import { serveFileIfMatch } from './file-serving.js';
 import { buildPublicUrlBase, requestContext, makeFileUrl } from './request-context.js';
 
@@ -306,6 +307,78 @@ Returns the output GLB path + URL and an asset_id that can be passed to download
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: 'text' as const, text: `Error applying part names: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Tool: merge_parts
+  // -------------------------------------------------------------------------
+
+  server.tool(
+    'merge_parts',
+    `Physically fuse a set of GLB nodes into a single node (geometry-level merge). Use this to clean up over-segmented models — e.g., when segment_model produces many tiny fragments that should be one part.
+
+How it differs from apply_part_names groups: apply_part_names only reparents nodes (they remain selectable separately); merge_parts combines vertex buffers so the merged result is truly one mesh. Original member nodes are removed.
+
+Semantics:
+- Node indices match inspect_model's order.
+- Each member's geometry is transformed to world space, then combined.
+- Members with different materials stay valid: the merged mesh carries one primitive per material.
+- A node can appear in at most one merge per call.
+- The new node has an identity transform (vertex data is baked in world space).
+- The new node is attached to the members' common original parent when they share one; otherwise to the scene root (warning emitted).
+- Members without a mesh are skipped.
+
+Call inspect_model first to see indices, then decide which clusters to merge. Typically follows this pattern: segment_model → inspect_model → merge_parts → inspect_model again → apply_part_names.`,
+    {
+      glb_path: z.string().describe('Absolute path to the source GLB.'),
+      merges: z
+        .array(
+          z.object({
+            name: z.string().describe('Name of the resulting merged node and its mesh.'),
+            member_indices: z
+              .array(z.number().int().nonnegative())
+              .min(2)
+              .describe('Indices of at least 2 nodes whose geometry will be fused into one.'),
+          }),
+        )
+        .min(1)
+        .describe('One or more merge instructions. Each combines the listed members into one new node.'),
+    },
+    async (params) => {
+      try {
+        const result = await mergeParts({
+          glb_path: params.glb_path,
+          merges: params.merges,
+        });
+
+        const lines: string[] = [
+          'Parts merged successfully.',
+          '',
+          `File: ${result.output_path}`,
+        ];
+        const url = makeFileUrl(result.output_path);
+        if (url) lines.push(`URL: ${url}`);
+        lines.push(`Asset ID: ${result.asset_id}`);
+        lines.push(`Merges applied: ${result.applied_merges}`);
+        lines.push(`Nodes removed: ${result.removed_nodes}`);
+        lines.push(`Meshes removed: ${result.removed_meshes}`);
+        lines.push(`Source: ${result.source}`);
+        if (result.warnings.length > 0) {
+          lines.push('', 'Warnings:');
+          for (const w of result.warnings) lines.push(`  - ${w}`);
+        }
+
+        return {
+          content: [{ type: 'text' as const, text: lines.join('\n') }],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: `Error merging parts: ${msg}` }],
           isError: true,
         };
       }

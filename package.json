@@ -17,7 +17,9 @@
   },
   "dependencies": {
     "@gltf-transform/core": "^4.3.0",
+    "@gltf-transform/functions": "^4.3.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "gl-matrix": "^3.4.4",
     "zod": "^3.23.0"
   },
   "devDependencies": {
