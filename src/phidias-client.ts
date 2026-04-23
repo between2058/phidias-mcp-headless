@@ -432,6 +432,12 @@ export async function segment3D(
 
   if (!result) throw new Error('P3-SAM polling timed out after 5 minutes');
 
+  if (!result.segmented_glb_url) {
+    throw new Error(
+      `P3-SAM returned completed status but no segmented_glb_url. Full result: ${JSON.stringify(result)}`,
+    );
+  }
+
   // 3. Download segmented GLB
   const glbFileName = result.segmented_glb_url.split('/').pop() || 'segmented.glb';
   const downloadId = result.request_id || jobId;

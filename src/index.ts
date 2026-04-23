@@ -155,8 +155,8 @@ If the user hasn't specified which backend to use, ask them. Returns the file pa
     'Segment a 3D model (GLB) into individual parts using P3-SAM AI. Splits a single mesh into meaningful parts (e.g. head, body, legs, arms). Takes 1-3 minutes. Returns the file path of the segmented GLB and the number of parts.',
     {
       glb_path: z.string().describe('Absolute path to a GLB file to segment.'),
-      point_num: z.number().int().min(1).max(50).optional().describe('Number of sample points per part (default: 10). Higher = finer segmentation but slower.'),
-      prompt_num: z.number().int().min(1).max(20).optional().describe('Number of prompts for segmentation (default: 6).'),
+      point_num: z.number().int().min(1000).max(20000).optional().describe('Number of sample points (P3-SAM backend requires >= 1000; default: backend default).'),
+      prompt_num: z.number().int().min(10).max(200).optional().describe('Number of prompts for segmentation (P3-SAM backend requires >= 10; default: backend default).'),
       threshold: z.number().min(0).max(1).optional().describe('Segmentation threshold (default: 0.5). Lower = more parts, higher = fewer parts.'),
       seed: z.number().int().optional().describe('Random seed for reproducibility.'),
     },
