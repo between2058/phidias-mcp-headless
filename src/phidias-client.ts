@@ -405,7 +405,10 @@ export async function segment3D(
     status: string;
     request_id: string;
     num_parts: number;
-    segmented_glb_url: string;
+    // Newer backend returns `segmented_glb` as a download path like
+    // "/download/<request_id>/<filename>". Older builds used `segmented_glb_url`.
+    segmented_glb?: string;
+    segmented_glb_url?: string;
   }
 
   let result: P3SAMResult | null = null;
@@ -432,14 +435,17 @@ export async function segment3D(
 
   if (!result) throw new Error('P3-SAM polling timed out after 5 minutes');
 
-  if (!result.segmented_glb_url) {
+  const segmentedPath = result.segmented_glb ?? result.segmented_glb_url;
+  if (!segmentedPath) {
     throw new Error(
-      `P3-SAM returned completed status but no segmented_glb_url. Full result: ${JSON.stringify(result)}`,
+      `P3-SAM returned completed status but no segmented_glb path. Full result: ${JSON.stringify(result)}`,
     );
   }
 
   // 3. Download segmented GLB
-  const glbFileName = result.segmented_glb_url.split('/').pop() || 'segmented.glb';
+  // `segmentedPath` looks like "/download/<request_id>/<filename>"; take the last
+  // segment as the filename we want to save locally.
+  const glbFileName = segmentedPath.split('/').pop() || 'segmented.glb';
   const downloadId = result.request_id || jobId;
   const downloadRes = await fetch(
     `${P3SAM_API_URL}/download/${downloadId}/${glbFileName}`,
