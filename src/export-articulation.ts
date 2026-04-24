@@ -21,7 +21,7 @@ import { getOutputDir, trackSessionAsset } from './phidias-client.js';
 const execFileP = promisify(execFile);
 
 const ARTICULATION_API_URL =
-  process.env.ARTICULATION_API_URL ?? 'http://172.18.245.177:50271';
+  process.env.ARTICULATION_API_URL ?? 'http://172.18.245.177:52071';
 
 // Path to the bundled USDZ → phidias.physics.v1 converter. Shipped inside
 // this repo at `scripts/usdz_to_phidias_physics.py`; resolved relative to the
