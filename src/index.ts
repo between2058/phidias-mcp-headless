@@ -27,6 +27,7 @@ import { inspectGltf } from './inspect-model.js';
 import { applyPartNames } from './apply-part-names.js';
 import { mergeParts } from './merge-parts.js';
 import { scaleModel } from './scale-model.js';
+import { groundModel } from './ground-model.js';
 import {
   exportArticulation,
   MATERIAL_PRESET_KEYS,
@@ -468,6 +469,81 @@ Returns the scaled GLB path + URL, the applied factor, original and final bbox s
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: 'text' as const, text: `Error scaling model: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Tool: ground_model
+  // -------------------------------------------------------------------------
+
+  server.tool(
+    'ground_model',
+    `Translate a GLB so its bounding-box minimum Y lands on 0 (i.e. "drop the asset onto the ground plane"). Optionally also recenter the XZ axes so the object's vertical axis passes through the world origin — standard Isaac Sim / Omniverse / URDF convention: asset origin at the footprint centre, Y=0 is the floor.
+
+Only translation is applied. Scale, rotation, and handedness are never touched — this is pure positioning so the aspect ratio and orientation chosen by the 3D generator survive unchanged.
+
+Recommended placement in the pipeline: right after scale_model, so every subsequent step (segment_model, inspect_model, export_articulation) sees coordinates already in the grounded/centred frame. Joint anchors pulled from inspect_model bboxes are then directly usable in Isaac Sim without any post-hoc translation.
+
+  generate_3d → scale_model → ground_model → segment_model → ...
+
+Returns the translation applied (dx, dy, dz), original bbox, final bbox, and the new GLB path + URL.`,
+    {
+      glb_path: z.string().describe('Absolute path to the GLB to ground.'),
+      center_xz: z
+        .boolean()
+        .optional()
+        .describe(
+          'Also recenter the XZ axes so the bbox centre lies on the world Y axis. Default true. Set false to preserve any existing XZ offset.',
+        ),
+    },
+    async (params) => {
+      try {
+        const result = await groundModel({
+          glb_path: params.glb_path,
+          center_xz: params.center_xz,
+        });
+        const lines: string[] = [
+          'Model grounded successfully.',
+          '',
+          `File: ${result.output_path}`,
+        ];
+        const url = makeFileUrl(result.output_path);
+        if (url) lines.push(`URL: ${url}`);
+        lines.push(`Asset ID: ${result.asset_id}`);
+        lines.push(
+          `Translation applied (dx, dy, dz): ${result.translation_applied
+            .map((v) => v.toFixed(4))
+            .join(', ')}`,
+        );
+        lines.push(
+          `Original bbox: min=[${result.original_bbox.min
+            .map((v) => v.toFixed(4))
+            .join(', ')}] max=[${result.original_bbox.max
+            .map((v) => v.toFixed(4))
+            .join(', ')}]`,
+        );
+        lines.push(
+          `Final bbox:    min=[${result.final_bbox.min
+            .map((v) => v.toFixed(4))
+            .join(', ')}] max=[${result.final_bbox.max
+            .map((v) => v.toFixed(4))
+            .join(', ')}]`,
+        );
+        lines.push(`Source: ${result.source}`);
+        if (result.warnings.length > 0) {
+          lines.push('', 'Warnings:');
+          for (const w of result.warnings) lines.push(`  - ${w}`);
+        }
+        return {
+          content: [{ type: 'text' as const, text: lines.join('\n') }],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: `Error grounding model: ${msg}` }],
           isError: true,
         };
       }
