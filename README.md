@@ -12,8 +12,12 @@ Phidias 資產生成 pipeline 的 **headless** MCP server —— 給 Claude Code
 |---|---|
 | `generate_image` | 用 Qwen 從 prompt 生參考圖（PNG） |
 | `generate_3d` | 從參考圖生 3D 模型（GLB），支援 `trellis2` 高品質 / `reconviagen` 快速 |
-| `segment_model` | 用 P3-SAM 把 GLB 切成語意部件（頭、身體、腿……） |
-| `list_generated_assets` | 列出當次 session 生成的所有檔案 |
+| `segment_model` | 用 P3-SAM 把 GLB 切成語意部件 |
+| `inspect_model` | 讀 GLB 結構（node、bbox、centroid、face count） |
+| `merge_parts` | 把多個 node 幾何融合成單一 mesh |
+| `apply_part_names` | 重新命名 / 重新編組 GLB 節點 |
+| `export_articulation` | 從 GLB + parts/joints 描述產出 USDZ + phidias.physics.v1 JSON |
+| `download_asset` / `list_generated_assets` | Session 資產管理 |
 
 ---
 
@@ -22,6 +26,7 @@ Phidias 資產生成 pipeline 的 **headless** MCP server —— 給 Claude Code
 - Node.js 18+
 - pnpm
 - 同網路能連到 Phidias 內部 API（預設走 `172.18.245.177`）
+- **只有 `export_articulation` 需要**：`python3` 3.8+ 與 `usdcat`（OpenUSD toolchain；macOS 由 Xcode Command Line Tools 提供）。轉換腳本已 bundle 在 repo 的 `scripts/` 裡，不需要額外 clone。
 
 ---
 
@@ -67,6 +72,8 @@ pnpm build
 | `TRELLIS2_API_URL` | `http://172.18.245.177:52070` | 3D（高品質） |
 | `RECONVIAGEN_API_URL` | `http://172.18.245.177:52069` | 3D（快速） |
 | `P3SAM_API_URL` | `http://172.18.245.177:5001` | 分割 |
+| `ARTICULATION_API_URL` | `http://172.18.245.177:50271` | 產出 USDZ 的 articulation-service |
+| `PHIDIAS_PHYSICS_CONVERTER_PATH` | bundle 在 `<pkg>/scripts/usdz_to_phidias_physics.py` | USDZ → phidias.physics.v1 JSON 轉換腳本，需要 `python3` + `usdcat`。只有要指向 fork 版才需要覆寫。 |
 
 在 Claude Code config 中加 `env` 欄位：
 

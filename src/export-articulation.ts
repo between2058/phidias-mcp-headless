@@ -11,8 +11,8 @@
  */
 
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { NodeIO } from '@gltf-transform/core';
@@ -23,14 +23,18 @@ const execFileP = promisify(execFile);
 const ARTICULATION_API_URL =
   process.env.ARTICULATION_API_URL ?? 'http://172.18.245.177:50271';
 
-// Path to scripts/usdz_to_phidias_physics.py from the phidias-standalone repo.
-// Used as a post-step to convert the produced USDZ into a phidias.physics.v1
-// JSON that the frontend Physics Editor's "Import Config" button accepts.
+// Path to the bundled USDZ → phidias.physics.v1 converter. Shipped inside
+// this repo at `scripts/usdz_to_phidias_physics.py`; resolved relative to the
+// built JS so it works regardless of install location (pnpm link, npm global,
+// monorepo, etc.). Callers may override with PHIDIAS_PHYSICS_CONVERTER_PATH to
+// point at a fork or an alternative converter.
 const PHYSICS_CONVERTER_PATH =
   process.env.PHIDIAS_PHYSICS_CONVERTER_PATH ??
-  path.join(
-    os.homedir(),
-    'Documents/gitlab_code/phidias-standalone/scripts/usdz_to_phidias_physics.py',
+  path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    '..',
+    'scripts',
+    'usdz_to_phidias_physics.py',
   );
 
 // ---------------------------------------------------------------------------

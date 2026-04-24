@@ -8,7 +8,8 @@
     "phidias-mcp-headless": "dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "scripts"
   ],
   "scripts": {
     "start": "tsx src/index.ts",
