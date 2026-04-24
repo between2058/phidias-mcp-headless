@@ -407,6 +407,8 @@ Node indices from inspect_model are NOT used directly here — the backend ident
 
 Every \`parts[].id\` MUST correspond to a GLB node that directly carries a mesh. Empty group nodes (produced by apply_part_names \`groups:\`) are rejected pre-flight — fuse their children with merge_parts first. The tool also re-writes the emitted phidias.physics.v1 JSON so part ids match the GLB node names, which is what the Phidias Physics Editor's MotionPreviewController uses to bind joints to meshes.
 
+Joint limits are auto-oriented from the GLB's geometry: for each revolute / prismatic joint MCP checks whether positive motion moves the child away from or into the parent bulk, and flips \`lower_limit\` / \`upper_limit\` signs if needed so the convention "positive = opens outward" always holds. Each flip is reported as a warning. Opt out per-joint with \`auto_orient_limits: false\` if you deliberately want backward-swinging motion.
+
 Material presets are expanded client-side. If a part has \`material_preset: "steel"\`, density / friction / restitution are filled from a preset table (see the enum in the schema). Explicit numeric fields override the preset.
 
 Returns the local path and URL of the produced USD file plus an asset_id usable with download_asset.`,
@@ -453,6 +455,12 @@ Returns the local path and URL of the produced USD file plus an asset_id usable 
             drive_max_force: z.number().min(0).nullable().optional(),
             drive_type: z.enum(['position', 'velocity', 'none']).optional(),
             disable_collision: z.boolean().optional().describe('Disable collision between parent and child of this joint. Default true.'),
+            auto_orient_limits: z
+              .boolean()
+              .optional()
+              .describe(
+                'When true (default), MCP checks geometry and flips limit signs if positive motion would go INTO the parent bulk, so "positive = opens outward" regardless of which GLB axis is the model\'s front. Set false to keep the exact signs you provided (e.g. for deliberately backward-swinging motion).',
+              ),
           }),
         )
         .describe('Array of joints linking parts into a kinematic structure. Can be empty for a single rigid body.'),

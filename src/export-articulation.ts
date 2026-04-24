@@ -17,7 +17,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { NodeIO } from '@gltf-transform/core';
+import { NodeIO, getBounds } from '@gltf-transform/core';
 import { getOutputDir, trackSessionAsset } from './phidias-client.js';
 import { parseUsdaToPhysics } from './usda-to-physics-json.js';
 
@@ -97,6 +97,12 @@ export interface ExportJoint {
   drive_max_force?: number | null;
   drive_type?: 'position' | 'velocity' | 'none';
   disable_collision?: boolean;
+  // When true (the default), MCP checks the joint's geometry and flips
+  // limit signs if positive motion goes INTO the parent bulk, so
+  // "positive = opens outward" holds regardless of which axis of the GLB
+  // happens to be the model's front. Set false to keep the exact signs
+  // you provided (e.g. when you deliberately want backward-swinging motion).
+  auto_orient_limits?: boolean;
 }
 
 export interface ExportArticulationParams {
@@ -157,42 +163,170 @@ function expandPreset(p: ExportPart): {
 }
 
 // ---------------------------------------------------------------------------
-// Pre-flight GLB validation
+// Pre-flight GLB read
 // ---------------------------------------------------------------------------
+
+// One pass over the GLB gives us everything we need for pre-flight work:
+//   • whether each named node directly carries a mesh (validation)
+//   • world-space bbox + centroid of each meshed node (joint-direction
+//     analysis, so we can auto-orient limit signs so "positive = opens
+//     outward" regardless of the model's front-facing axis)
+interface PartGeometry {
+  name: string;
+  hasMesh: boolean;
+  worldCentroid: [number, number, number] | null;
+}
+
+async function readPartGeometries(
+  glbPath: string,
+): Promise<Map<string, PartGeometry>> {
+  const io = new NodeIO();
+  const doc = await io.read(glbPath);
+  const out = new Map<string, PartGeometry>();
+  for (const node of doc.getRoot().listNodes()) {
+    const name = node.getName();
+    if (!name) continue;
+    const hasMesh = Boolean(node.getMesh());
+    let worldCentroid: [number, number, number] | null = null;
+    if (hasMesh) {
+      try {
+        const b = getBounds(node);
+        if (
+          b &&
+          b.min.every((v) => Number.isFinite(v)) &&
+          b.max.every((v) => Number.isFinite(v))
+        ) {
+          worldCentroid = [
+            (b.min[0] + b.max[0]) / 2,
+            (b.min[1] + b.max[1]) / 2,
+            (b.min[2] + b.max[2]) / 2,
+          ];
+        }
+      } catch {
+        // leave centroid null if gltf-transform can't resolve bounds
+      }
+    }
+    // If the same name appears twice, prefer the mesh-bearing entry.
+    const prior = out.get(name);
+    if (!prior || (!prior.hasMesh && hasMesh)) {
+      out.set(name, { name, hasMesh, worldCentroid });
+    }
+  }
+  return out;
+}
 
 // Each part.id in the articulation call must resolve to a GLB node that
 // *directly* carries a mesh. An empty group node (e.g. one produced by
-// apply_part_names' `groups:` reparenting without merge) is written to the
-// USDZ as an Xform with no Mesh child, and the downstream Python converter
-// (scripts/usdz_to_phidias_physics.py:parse_parts) silently drops it — the
-// Physics Editor then sees a phantom base with no geometry. We catch it here
-// and redirect the caller to `merge_parts`.
-interface MeshValidation {
-  missing: string[];
-  noMesh: string[];
-}
-
-async function validatePartsHaveMesh(
-  glbPath: string,
+// apply_part_names' `groups:` reparenting without merge) would be written as
+// an Xform with no Mesh child and silently dropped by the physics JSON
+// pipeline. Catch it here and redirect the caller to `merge_parts`.
+function validatePartsHaveMesh(
+  geometries: Map<string, PartGeometry>,
   partIds: string[],
-): Promise<MeshValidation> {
-  const io = new NodeIO();
-  const doc = await io.read(glbPath);
-  const nodes = doc.getRoot().listNodes();
-  const meshByName = new Map<string, boolean>();
-  for (const n of nodes) {
-    const name = n.getName();
-    if (!name) continue;
-    // If the same name appears twice, prefer "has mesh" = true.
-    meshByName.set(name, Boolean(n.getMesh()) || (meshByName.get(name) ?? false));
-  }
+): { missing: string[]; noMesh: string[] } {
   const missing: string[] = [];
   const noMesh: string[] = [];
   for (const id of partIds) {
-    if (!meshByName.has(id)) missing.push(id);
-    else if (!meshByName.get(id)) noMesh.push(id);
+    const g = geometries.get(id);
+    if (!g) missing.push(id);
+    else if (!g.hasMesh) noMesh.push(id);
   }
   return { missing, noMesh };
+}
+
+// ---------------------------------------------------------------------------
+// Joint direction analysis (auto-orient limit signs)
+// ---------------------------------------------------------------------------
+
+type Vec3 = [number, number, number];
+
+function vSub(a: Vec3, b: Vec3): Vec3 {
+  return [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+}
+function vLen(a: Vec3): number {
+  return Math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+}
+function vNorm(a: Vec3): Vec3 | null {
+  const l = vLen(a);
+  if (l < 1e-9) return null;
+  return [a[0] / l, a[1] / l, a[2] / l];
+}
+function vDot(a: Vec3, b: Vec3): number {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+function vCross(a: Vec3, b: Vec3): Vec3 {
+  return [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
+}
+
+// Decide whether positive motion along this joint moves the child AWAY from
+// the parent bulk ("opens outward"). Returns null when the geometry is
+// degenerate / inconclusive — caller should not flip in that case.
+function analyzeJointDirection(opts: {
+  jointType: 'revolute' | 'prismatic' | 'fixed';
+  axis: Vec3;
+  anchor: Vec3;
+  childCentroid: Vec3;
+  parentCentroid: Vec3;
+}): { positiveOpensOutward: boolean; confidence: number } | null {
+  const { jointType, axis, anchor, childCentroid, parentCentroid } = opts;
+  if (jointType === 'fixed') return null;
+
+  const outwardN = vNorm(vSub(childCentroid, parentCentroid));
+  const axisN = vNorm(axis);
+  if (!outwardN || !axisN) return null;
+
+  let tangentN: Vec3 | null;
+  if (jointType === 'prismatic') {
+    // Displacement along `axis` by +d moves child by +d * axisN.
+    tangentN = axisN;
+  } else {
+    // Revolute: at θ=0 the velocity of the child centroid is axis × r,
+    // where r = childCentroid − anchor.
+    const r = vSub(childCentroid, anchor);
+    tangentN = vNorm(vCross(axisN, r));
+    if (!tangentN) return null; // child sits on the rotation axis
+  }
+
+  const cosTheta = vDot(tangentN, outwardN);
+  return {
+    positiveOpensOutward: cosTheta > 0,
+    confidence: Math.abs(cosTheta),
+  };
+}
+
+// Flip a single joint's limits so `positive ≡ opens outward` becomes true.
+// Returns the new joint plus a human description of what changed; caller
+// writes this into warnings so the user sees every auto-orient decision.
+function reorientJointLimits(
+  joint: ExportJoint,
+  analysis: { positiveOpensOutward: boolean; confidence: number },
+): { joint: ExportJoint; flipped: boolean; reason: string } {
+  // Confidence threshold: if the tangent is nearly perpendicular to the
+  // outward direction, the sign is ambiguous, so leave the user's limits
+  // alone rather than risk a wrong flip.
+  if (analysis.confidence < 0.2) {
+    return {
+      joint,
+      flipped: false,
+      reason: `auto-orient skipped (ambiguous: |cosθ|=${analysis.confidence.toFixed(2)})`,
+    };
+  }
+  if (analysis.positiveOpensOutward) {
+    return { joint, flipped: false, reason: 'auto-orient: positive already opens outward' };
+  }
+  const lo = joint.lower_limit;
+  const hi = joint.upper_limit;
+  const newLower = typeof hi === 'number' ? -hi : hi ?? null;
+  const newUpper = typeof lo === 'number' ? -lo : lo ?? null;
+  return {
+    joint: { ...joint, lower_limit: newLower, upper_limit: newUpper },
+    flipped: true,
+    reason: `auto-oriented: positive rotation moved child INTO parent bulk; flipped [${lo}, ${hi}] → [${newLower}, ${newUpper}]`,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -288,11 +422,15 @@ export async function exportArticulation(
 
   const warnings: string[] = [];
 
+  // One pass over the GLB gives us per-part mesh-presence + centroid,
+  // used for both pre-flight validation and joint-direction auto-orient.
+  const geometries = await readPartGeometries(params.glb_path);
+
   // Pre-flight: every part.id must resolve to a GLB node with a real mesh.
   // An empty group node (leftover from apply_part_names groups:) would
   // vanish in the physics JSON and produce a broken articulation.
-  const meshCheck = await validatePartsHaveMesh(
-    params.glb_path,
+  const meshCheck = validatePartsHaveMesh(
+    geometries,
     params.parts.map((p) => p.id),
   );
   if (meshCheck.missing.length > 0 || meshCheck.noMesh.length > 0) {
@@ -326,6 +464,28 @@ export async function exportArticulation(
     }
   }
 
+  // Auto-orient each joint's limit signs so "positive = opens outward" holds
+  // regardless of which GLB axis happens to be the front of the model.
+  const orientedJoints = params.joints.map((j) => {
+    if (j.auto_orient_limits === false) return j;
+    const type = j.type ?? 'revolute';
+    if (type === 'fixed') return j;
+    const childG = geometries.get(j.child);
+    const parentG = geometries.get(j.parent);
+    if (!childG?.worldCentroid || !parentG?.worldCentroid) return j;
+    const analysis = analyzeJointDirection({
+      jointType: type,
+      axis: j.axis ?? [0, 0, 1],
+      anchor: j.anchor ?? [0, 0, 0],
+      childCentroid: childG.worldCentroid,
+      parentCentroid: parentG.worldCentroid,
+    });
+    if (!analysis) return j;
+    const { joint: nextJoint, flipped, reason } = reorientJointLimits(j, analysis);
+    if (flipped) warnings.push(`joint "${j.name}": ${reason}`);
+    return nextJoint;
+  });
+
   // Expand material presets client-side (backend only speaks numeric).
   let expandedCount = 0;
   const expandedParts = params.parts.map((p) => {
@@ -334,10 +494,15 @@ export async function exportArticulation(
     return part;
   });
 
+  // Strip client-only fields (auto_orient_limits) before sending to backend.
+  const backendJoints = orientedJoints.map(({ auto_orient_limits, ...rest }) => {
+    void auto_orient_limits;
+    return rest;
+  });
   const articulation = {
     model_name: params.model_name,
     parts: expandedParts,
-    joints: params.joints,
+    joints: backendJoints,
   };
 
   // Upload GLB + articulation JSON as multipart/form-data.
