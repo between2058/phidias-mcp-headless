@@ -460,7 +460,7 @@ Returns the local path and URL of the produced USD file plus an asset_id usable 
         .boolean()
         .optional()
         .describe(
-          'If true (default for USDZ), also emit a phidias.physics.v1 JSON next to the USDZ by running the official usdz_to_phidias_physics.py converter. This JSON is what the Phidias frontend Physics Editor\'s "Import Config" button accepts directly. Requires `python3` and `usdcat` on PATH. Ignored for USDA output. Conversion failures are reported as warnings and do not fail the USDZ export.',
+          'If true (default), also emit a phidias.physics.v1 JSON next to the USDZ / USDA. This JSON is what the Phidias frontend Physics Editor\'s "Import Config" button accepts directly. Parsing is done in-process in TypeScript against the articulation-service\'s text USDA — no python / usdcat needed. Failures are reported as warnings and do not fail the export.',
         ),
     },
     async (params) => {

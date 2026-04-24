@@ -26,7 +26,6 @@ Phidias 資產生成 pipeline 的 **headless** MCP server —— 給 Claude Code
 - Node.js 18+
 - pnpm
 - 同網路能連到 Phidias 內部 API（預設走 `172.18.245.177`）
-- **只有 `export_articulation` 需要**：`python3` 3.8+ 與 `usdcat`（OpenUSD toolchain；macOS 由 Xcode Command Line Tools 提供）。轉換腳本已 bundle 在 repo 的 `scripts/` 裡，不需要額外 clone。
 
 ---
 
@@ -72,8 +71,7 @@ pnpm build
 | `TRELLIS2_API_URL` | `http://172.18.245.177:52070` | 3D（高品質） |
 | `RECONVIAGEN_API_URL` | `http://172.18.245.177:52069` | 3D（快速） |
 | `P3SAM_API_URL` | `http://172.18.245.177:5001` | 分割 |
-| `ARTICULATION_API_URL` | `http://172.18.245.177:50271` | 產出 USDZ 的 articulation-service |
-| `PHIDIAS_PHYSICS_CONVERTER_PATH` | bundle 在 `<pkg>/scripts/usdz_to_phidias_physics.py` | USDZ → phidias.physics.v1 JSON 轉換腳本，需要 `python3` + `usdcat`。只有要指向 fork 版才需要覆寫。 |
+| `ARTICULATION_API_URL` | `http://172.18.245.177:52071` | 產出 USDZ/USDA 的 articulation-service |
 
 在 Claude Code config 中加 `env` 欄位：
 

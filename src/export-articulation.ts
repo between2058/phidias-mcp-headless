@@ -8,34 +8,21 @@
  * entirely client-side here: if a part specifies `material_preset`, its
  * density / friction / restitution values are filled from MATERIAL_PRESETS,
  * but any explicit numeric override the caller provides wins.
+ *
+ * When emit_physics_json is true, an extra phidias.physics.v1 JSON is written
+ * alongside the USD file. Parsing the stage is done in-process by
+ * parseUsdaToPhysics() against the articulation-service's text USDA output —
+ * no python / usdcat / OpenUSD tooling is required on the host.
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { NodeIO } from '@gltf-transform/core';
 import { getOutputDir, trackSessionAsset } from './phidias-client.js';
-
-const execFileP = promisify(execFile);
+import { parseUsdaToPhysics } from './usda-to-physics-json.js';
 
 const ARTICULATION_API_URL =
   process.env.ARTICULATION_API_URL ?? 'http://172.18.245.177:52071';
-
-// Path to the bundled USDZ → phidias.physics.v1 converter. Shipped inside
-// this repo at `scripts/usdz_to_phidias_physics.py`; resolved relative to the
-// built JS so it works regardless of install location (pnpm link, npm global,
-// monorepo, etc.). Callers may override with PHIDIAS_PHYSICS_CONVERTER_PATH to
-// point at a fork or an alternative converter.
-const PHYSICS_CONVERTER_PATH =
-  process.env.PHIDIAS_PHYSICS_CONVERTER_PATH ??
-  path.resolve(
-    path.dirname(fileURLToPath(import.meta.url)),
-    '..',
-    'scripts',
-    'usdz_to_phidias_physics.py',
-  );
 
 // ---------------------------------------------------------------------------
 // Material presets — client-side expansion
@@ -213,30 +200,28 @@ async function validatePartsHaveMesh(
 // ---------------------------------------------------------------------------
 
 // The backend derives USDZ prim names from each part's `name` field
-// (spaces → underscores, other non-identifier chars → underscores). The
-// Python converter then emits those sanitized prim names as `parts[].id`
-// in the physics JSON — which means the ids no longer match the GLB node
-// names, so the frontend's MotionPreviewController cannot bind joints to
-// meshes via scene.getObjectByName(part.id).
-//
-// We rewrite the JSON post-convert so ids go back to the caller-supplied
-// ones (= GLB node names).
+// (spaces → underscores, other non-identifier chars → underscores). Our
+// USDA parser reads those sanitized prim names, so the resulting JSON
+// `id` values no longer match the GLB node names — the frontend's
+// MotionPreviewController binds joints to meshes via
+// scene.getObjectByName(part.id), so we mutate the JSON back to the
+// caller-supplied ids (and original names).
 function sanitizeUsdPrim(s: string): string {
   let r = s.replace(/[^A-Za-z0-9_]/g, '_');
   if (/^[0-9]/.test(r)) r = '_' + r;
   return r;
 }
 
-function remapPhysicsJsonIds(jsonPath: string, parts: ExportPart[]): void {
-  const raw = fs.readFileSync(jsonPath, 'utf-8');
-  const json = JSON.parse(raw) as {
-    baseId?: string | null;
-    parts?: Array<{ id?: string; name?: string } & Record<string, unknown>>;
-    joints?: Array<
-      { parentPartId?: string; childPartId?: string } & Record<string, unknown>
-    >;
-  };
+interface MutablePhysicsJson {
+  baseId?: string | null;
+  parts?: Array<{ id?: string; name?: string }>;
+  joints?: Array<{ parentPartId?: string; childPartId?: string }>;
+}
 
+function remapPhysicsJsonIds(
+  json: MutablePhysicsJson,
+  parts: ExportPart[],
+): void {
   // Build sanitized-prim → original-id / original-name lookup.
   const idByPrim = new Map<string, string>();
   const nameByPrim = new Map<string, string>();
@@ -282,8 +267,6 @@ function remapPhysicsJsonIds(jsonPath: string, parts: ExportPart[]): void {
       }
     }
   }
-
-  fs.writeFileSync(jsonPath, JSON.stringify(json, null, 2));
 }
 
 // ---------------------------------------------------------------------------
@@ -421,54 +404,70 @@ export async function exportArticulation(
     createdAt: new Date().toISOString(),
   });
 
-  // Post-step: convert USDZ → phidias.physics.v1 JSON so the frontend Physics
-  // Editor's "Import Config" button can load it directly. Only meaningful for
-  // USDZ (the Python script relies on unzipping it). Failures here do not fail
-  // the whole export — the USDZ is already a valid artifact.
+  // Post-step: produce a phidias.physics.v1 JSON for the frontend Physics
+  // Editor's "Import Config" button. The parser needs the stage as text USDA;
+  // when the caller asked for USDA we already have the right file on disk,
+  // otherwise we fire a second articulation-service call for USDA text. Failures
+  // here do not fail the whole export — the USD file is already a valid artifact.
   let physicsJsonPath: string | undefined;
   let physicsJsonAssetId: string | undefined;
   const emitJson = params.emit_physics_json ?? (params.format === 'usdz');
-  if (emitJson && params.format === 'usdz') {
+  if (emitJson) {
     try {
-      if (!fs.existsSync(PHYSICS_CONVERTER_PATH)) {
-        warnings.push(
-          `physics JSON skipped: converter script not found at ${PHYSICS_CONVERTER_PATH}. Set PHIDIAS_PHYSICS_CONVERTER_PATH to override.`,
-        );
+      let usdaText: string;
+      if (params.format === 'usda') {
+        usdaText = fs.readFileSync(outputPath, 'utf-8');
       } else {
-        const jsonOut = outputPath.replace(/\.usdz$/i, '.physics.json');
-        await execFileP(
-          'python3',
-          [PHYSICS_CONVERTER_PATH, outputPath, '-o', jsonOut],
-          { timeout: 60_000 },
+        // Second backend call just to get the text stage. The GLB + articulation
+        // description are identical, so only the endpoint changes.
+        const usdaForm = new FormData();
+        usdaForm.append('file', glbBlob, path.basename(params.glb_path));
+        usdaForm.append('articulation', JSON.stringify(articulation));
+        const usdaRes = await fetch(
+          `${ARTICULATION_API_URL}/api/export-usda`,
+          { method: 'POST', body: usdaForm },
         );
-        if (!fs.existsSync(jsonOut)) {
-          warnings.push(
-            `physics JSON conversion produced no output at ${jsonOut}`,
+        if (!usdaRes.ok) {
+          throw new Error(
+            `export-usda request failed (${usdaRes.status})`,
           );
-        } else {
-          // Restore caller-supplied ids (= GLB node names) so the
-          // frontend Physics Editor can bind joints to meshes via
-          // scene.getObjectByName(part.id). Non-fatal if it throws.
-          try {
-            remapPhysicsJsonIds(jsonOut, params.parts);
-          } catch (err) {
-            const m = err instanceof Error ? err.message : String(err);
-            warnings.push(`physics JSON id remap failed: ${m}`);
-          }
-          physicsJsonPath = jsonOut;
-          physicsJsonAssetId = `physics_${Date.now()}`;
-          trackSessionAsset({
-            id: physicsJsonAssetId,
-            type: 'model',
-            filePath: jsonOut,
-            sourceImagePath: outputPath,
-            createdAt: new Date().toISOString(),
-          });
         }
+        const usdaMeta = (await usdaRes.json()) as {
+          success: boolean;
+          download_url: string;
+        };
+        if (!usdaMeta.success) {
+          throw new Error('export-usda returned success=false');
+        }
+        const usdaDlUrl = usdaMeta.download_url.startsWith('http')
+          ? usdaMeta.download_url
+          : `${ARTICULATION_API_URL}${usdaMeta.download_url}`;
+        const usdaDl = await fetch(usdaDlUrl);
+        if (!usdaDl.ok) {
+          throw new Error(
+            `USDA download failed (${usdaDl.status}) from ${usdaDlUrl}`,
+          );
+        }
+        usdaText = await usdaDl.text();
       }
+
+      const physicsJson = parseUsdaToPhysics(usdaText, data.filename);
+      remapPhysicsJsonIds(physicsJson, params.parts);
+
+      const jsonOut = outputPath.replace(/\.usdz?$/i, '.physics.json');
+      fs.writeFileSync(jsonOut, JSON.stringify(physicsJson, null, 2));
+      physicsJsonPath = jsonOut;
+      physicsJsonAssetId = `physics_${Date.now()}`;
+      trackSessionAsset({
+        id: physicsJsonAssetId,
+        type: 'model',
+        filePath: jsonOut,
+        sourceImagePath: outputPath,
+        createdAt: new Date().toISOString(),
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      warnings.push(`physics JSON conversion failed: ${msg}`);
+      warnings.push(`physics JSON generation failed: ${msg}`);
     }
   }
 
