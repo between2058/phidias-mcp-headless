@@ -11,11 +11,27 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { NodeIO } from '@gltf-transform/core';
 import { getOutputDir, trackSessionAsset } from './phidias-client.js';
+
+const execFileP = promisify(execFile);
 
 const ARTICULATION_API_URL =
   process.env.ARTICULATION_API_URL ?? 'http://172.18.245.177:50271';
+
+// Path to scripts/usdz_to_phidias_physics.py from the phidias-standalone repo.
+// Used as a post-step to convert the produced USDZ into a phidias.physics.v1
+// JSON that the frontend Physics Editor's "Import Config" button accepts.
+const PHYSICS_CONVERTER_PATH =
+  process.env.PHIDIAS_PHYSICS_CONVERTER_PATH ??
+  path.join(
+    os.homedir(),
+    'Documents/gitlab_code/phidias-standalone/scripts/usdz_to_phidias_physics.py',
+  );
 
 // ---------------------------------------------------------------------------
 // Material presets — client-side expansion
@@ -98,6 +114,7 @@ export interface ExportArticulationParams {
   parts: ExportPart[];
   joints: ExportJoint[];
   format: 'usda' | 'usdz';
+  emit_physics_json?: boolean;
 }
 
 export interface ExportArticulationResult {
@@ -110,6 +127,8 @@ export interface ExportArticulationResult {
   source: string;
   format: 'usda' | 'usdz';
   warnings: string[];
+  physics_json_path?: string;
+  physics_json_asset_id?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +166,123 @@ function expandPreset(p: ExportPart): {
 }
 
 // ---------------------------------------------------------------------------
+// Pre-flight GLB validation
+// ---------------------------------------------------------------------------
+
+// Each part.id in the articulation call must resolve to a GLB node that
+// *directly* carries a mesh. An empty group node (e.g. one produced by
+// apply_part_names' `groups:` reparenting without merge) is written to the
+// USDZ as an Xform with no Mesh child, and the downstream Python converter
+// (scripts/usdz_to_phidias_physics.py:parse_parts) silently drops it — the
+// Physics Editor then sees a phantom base with no geometry. We catch it here
+// and redirect the caller to `merge_parts`.
+interface MeshValidation {
+  missing: string[];
+  noMesh: string[];
+}
+
+async function validatePartsHaveMesh(
+  glbPath: string,
+  partIds: string[],
+): Promise<MeshValidation> {
+  const io = new NodeIO();
+  const doc = await io.read(glbPath);
+  const nodes = doc.getRoot().listNodes();
+  const meshByName = new Map<string, boolean>();
+  for (const n of nodes) {
+    const name = n.getName();
+    if (!name) continue;
+    // If the same name appears twice, prefer "has mesh" = true.
+    meshByName.set(name, Boolean(n.getMesh()) || (meshByName.get(name) ?? false));
+  }
+  const missing: string[] = [];
+  const noMesh: string[] = [];
+  for (const id of partIds) {
+    if (!meshByName.has(id)) missing.push(id);
+    else if (!meshByName.get(id)) noMesh.push(id);
+  }
+  return { missing, noMesh };
+}
+
+// ---------------------------------------------------------------------------
+// Physics JSON ID re-map
+// ---------------------------------------------------------------------------
+
+// The backend derives USDZ prim names from each part's `name` field
+// (spaces → underscores, other non-identifier chars → underscores). The
+// Python converter then emits those sanitized prim names as `parts[].id`
+// in the physics JSON — which means the ids no longer match the GLB node
+// names, so the frontend's MotionPreviewController cannot bind joints to
+// meshes via scene.getObjectByName(part.id).
+//
+// We rewrite the JSON post-convert so ids go back to the caller-supplied
+// ones (= GLB node names).
+function sanitizeUsdPrim(s: string): string {
+  let r = s.replace(/[^A-Za-z0-9_]/g, '_');
+  if (/^[0-9]/.test(r)) r = '_' + r;
+  return r;
+}
+
+function remapPhysicsJsonIds(jsonPath: string, parts: ExportPart[]): void {
+  const raw = fs.readFileSync(jsonPath, 'utf-8');
+  const json = JSON.parse(raw) as {
+    baseId?: string | null;
+    parts?: Array<{ id?: string; name?: string } & Record<string, unknown>>;
+    joints?: Array<
+      { parentPartId?: string; childPartId?: string } & Record<string, unknown>
+    >;
+  };
+
+  // Build sanitized-prim → original-id / original-name lookup.
+  const idByPrim = new Map<string, string>();
+  const nameByPrim = new Map<string, string>();
+  for (const p of parts) {
+    for (const key of [p.name, p.id]) {
+      if (!key) continue;
+      const prim = sanitizeUsdPrim(key);
+      if (!idByPrim.has(prim)) idByPrim.set(prim, p.id);
+      if (!nameByPrim.has(prim)) nameByPrim.set(prim, p.name);
+    }
+  }
+
+  const remap = (v: unknown): string | undefined => {
+    if (typeof v !== 'string') return undefined;
+    return idByPrim.get(v);
+  };
+
+  if (typeof json.baseId === 'string') {
+    const r = remap(json.baseId);
+    if (r) json.baseId = r;
+  }
+  if (Array.isArray(json.parts)) {
+    for (const p of json.parts) {
+      if (typeof p.id === 'string') {
+        const r = remap(p.id);
+        if (r) {
+          p.id = r;
+          const nm = nameByPrim.get(sanitizeUsdPrim(r)) ?? nameByPrim.get(p.id);
+          if (nm) p.name = nm;
+        }
+      }
+    }
+  }
+  if (Array.isArray(json.joints)) {
+    for (const j of json.joints) {
+      if (typeof j.parentPartId === 'string') {
+        const r = remap(j.parentPartId);
+        if (r) j.parentPartId = r;
+      }
+      if (typeof j.childPartId === 'string') {
+        const r = remap(j.childPartId);
+        if (r) j.childPartId = r;
+      }
+    }
+  }
+
+  fs.writeFileSync(jsonPath, JSON.stringify(json, null, 2));
+}
+
+// ---------------------------------------------------------------------------
 // Main entry
 // ---------------------------------------------------------------------------
 
@@ -164,6 +300,28 @@ export async function exportArticulation(
   }
 
   const warnings: string[] = [];
+
+  // Pre-flight: every part.id must resolve to a GLB node with a real mesh.
+  // An empty group node (leftover from apply_part_names groups:) would
+  // vanish in the physics JSON and produce a broken articulation.
+  const meshCheck = await validatePartsHaveMesh(
+    params.glb_path,
+    params.parts.map((p) => p.id),
+  );
+  if (meshCheck.missing.length > 0 || meshCheck.noMesh.length > 0) {
+    const msgs: string[] = [];
+    if (meshCheck.missing.length > 0) {
+      msgs.push(
+        `parts[].id not found as a node name in the GLB: ${meshCheck.missing.join(', ')}`,
+      );
+    }
+    if (meshCheck.noMesh.length > 0) {
+      msgs.push(
+        `parts[].id references a node with no direct mesh — likely an empty group from apply_part_names. Fuse its children into a real mesh with merge_parts first: ${meshCheck.noMesh.join(', ')}`,
+      );
+    }
+    throw new Error(msgs.join(' | '));
+  }
 
   // Validate joint references against part IDs up-front — the backend silently
   // ignores orphan joints, so catching them here gives a much better error.
@@ -259,6 +417,57 @@ export async function exportArticulation(
     createdAt: new Date().toISOString(),
   });
 
+  // Post-step: convert USDZ → phidias.physics.v1 JSON so the frontend Physics
+  // Editor's "Import Config" button can load it directly. Only meaningful for
+  // USDZ (the Python script relies on unzipping it). Failures here do not fail
+  // the whole export — the USDZ is already a valid artifact.
+  let physicsJsonPath: string | undefined;
+  let physicsJsonAssetId: string | undefined;
+  const emitJson = params.emit_physics_json ?? (params.format === 'usdz');
+  if (emitJson && params.format === 'usdz') {
+    try {
+      if (!fs.existsSync(PHYSICS_CONVERTER_PATH)) {
+        warnings.push(
+          `physics JSON skipped: converter script not found at ${PHYSICS_CONVERTER_PATH}. Set PHIDIAS_PHYSICS_CONVERTER_PATH to override.`,
+        );
+      } else {
+        const jsonOut = outputPath.replace(/\.usdz$/i, '.physics.json');
+        await execFileP(
+          'python3',
+          [PHYSICS_CONVERTER_PATH, outputPath, '-o', jsonOut],
+          { timeout: 60_000 },
+        );
+        if (!fs.existsSync(jsonOut)) {
+          warnings.push(
+            `physics JSON conversion produced no output at ${jsonOut}`,
+          );
+        } else {
+          // Restore caller-supplied ids (= GLB node names) so the
+          // frontend Physics Editor can bind joints to meshes via
+          // scene.getObjectByName(part.id). Non-fatal if it throws.
+          try {
+            remapPhysicsJsonIds(jsonOut, params.parts);
+          } catch (err) {
+            const m = err instanceof Error ? err.message : String(err);
+            warnings.push(`physics JSON id remap failed: ${m}`);
+          }
+          physicsJsonPath = jsonOut;
+          physicsJsonAssetId = `physics_${Date.now()}`;
+          trackSessionAsset({
+            id: physicsJsonAssetId,
+            type: 'model',
+            filePath: jsonOut,
+            sourceImagePath: outputPath,
+            createdAt: new Date().toISOString(),
+          });
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      warnings.push(`physics JSON conversion failed: ${msg}`);
+    }
+  }
+
   return {
     output_path: outputPath,
     backend_filename: data.filename,
@@ -269,5 +478,7 @@ export async function exportArticulation(
     source: params.glb_path,
     format: params.format,
     warnings,
+    physics_json_path: physicsJsonPath,
+    physics_json_asset_id: physicsJsonAssetId,
   };
 }

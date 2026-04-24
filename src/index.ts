@@ -261,6 +261,8 @@ Node indices match the order returned by inspect_model. Call inspect_model first
 
 Grouping: each entry in \`groups\` creates a new parent node with the given name and moves the listed members to become its children. If all members share the same original parent, the new group is attached there; otherwise it is attached to the scene root and a warning is emitted. A node can belong to only one group per call.
 
+IMPORTANT: \`groups\` only reparents nodes — the group node itself has NO mesh geometry. If the eventual goal is export_articulation (physics), do NOT use \`groups\` to produce a part: the empty group node is dropped by the physics JSON pipeline and the resulting articulation will be broken. Use \`merge_parts\` instead to fuse fragments into a single real mesh, then name that merged node with this tool. Use \`groups\` only for scene-graph organisation that is purely cosmetic.
+
 Returns the output GLB path + URL and an asset_id that can be passed to download_asset.`,
     {
       glb_path: z.string().describe('Absolute path to the source GLB.'),
@@ -403,6 +405,8 @@ Typical pipeline:
 
 Node indices from inspect_model are NOT used directly here — the backend identifies parts by string \`id\`. A natural convention is to use the node name (after apply_part_names) as the id, then the joint \`parent\` / \`child\` fields reference those ids.
 
+Every \`parts[].id\` MUST correspond to a GLB node that directly carries a mesh. Empty group nodes (produced by apply_part_names \`groups:\`) are rejected pre-flight — fuse their children with merge_parts first. The tool also re-writes the emitted phidias.physics.v1 JSON so part ids match the GLB node names, which is what the Phidias Physics Editor's MotionPreviewController uses to bind joints to meshes.
+
 Material presets are expanded client-side. If a part has \`material_preset: "steel"\`, density / friction / restitution are filled from a preset table (see the enum in the schema). Explicit numeric fields override the preset.
 
 Returns the local path and URL of the produced USD file plus an asset_id usable with download_asset.`,
@@ -452,6 +456,12 @@ Returns the local path and URL of the produced USD file plus an asset_id usable 
           }),
         )
         .describe('Array of joints linking parts into a kinematic structure. Can be empty for a single rigid body.'),
+      emit_physics_json: z
+        .boolean()
+        .optional()
+        .describe(
+          'If true (default for USDZ), also emit a phidias.physics.v1 JSON next to the USDZ by running the official usdz_to_phidias_physics.py converter. This JSON is what the Phidias frontend Physics Editor\'s "Import Config" button accepts directly. Requires `python3` and `usdcat` on PATH. Ignored for USDA output. Conversion failures are reported as warnings and do not fail the USDZ export.',
+        ),
     },
     async (params) => {
       try {
@@ -461,6 +471,7 @@ Returns the local path and URL of the produced USD file plus an asset_id usable 
           parts: params.parts,
           joints: params.joints,
           format: params.format,
+          emit_physics_json: params.emit_physics_json,
         });
 
         const lines: string[] = [
@@ -478,6 +489,16 @@ Returns the local path and URL of the produced USD file plus an asset_id usable 
           lines.push(`Material presets expanded: ${result.presets_expanded}`);
         }
         lines.push(`Source GLB: ${result.source}`);
+        if (result.physics_json_path) {
+          lines.push('');
+          lines.push(`Physics config JSON: ${result.physics_json_path}`);
+          const jsonUrl = makeFileUrl(result.physics_json_path);
+          if (jsonUrl) lines.push(`Physics config URL: ${jsonUrl}`);
+          if (result.physics_json_asset_id) {
+            lines.push(`Physics config asset ID: ${result.physics_json_asset_id}`);
+          }
+          lines.push('(phidias.physics.v1 — import via Physics Editor "Import Config" button)');
+        }
         if (result.warnings.length > 0) {
           lines.push('', 'Warnings:');
           for (const w of result.warnings) lines.push(`  - ${w}`);
