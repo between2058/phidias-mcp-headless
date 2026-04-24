@@ -26,6 +26,7 @@ import {
 import { inspectGltf } from './inspect-model.js';
 import { applyPartNames } from './apply-part-names.js';
 import { mergeParts } from './merge-parts.js';
+import { scaleModel } from './scale-model.js';
 import {
   exportArticulation,
   MATERIAL_PRESET_KEYS,
@@ -385,6 +386,88 @@ Call inspect_model first to see indices, then decide which clusters to merge. Ty
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: 'text' as const, text: `Error merging parts: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Tool: scale_model
+  // -------------------------------------------------------------------------
+
+  server.tool(
+    'scale_model',
+    `Uniformly scale a GLB so its bounding box matches one or more real-world physical dimensions in meters. The 3D generation backends (trellis2, reconviagen) output models normalised to a unit-ish bbox ([-0.5, 0.5]), which means Isaac Sim / Omniverse / any USD-aware physics consumer loads everything at the same size. Run this before export_articulation so the emitted USDZ and phidias.physics.v1 JSON are at physically accurate scale.
+
+Only a single uniform scale factor is applied — the model's aspect ratio is preserved. Per-axis scaling would distort geometry (a wheel becoming oval) and is deliberately NOT supported.
+
+At least one of \`width_m\` / \`height_m\` / \`depth_m\` is required. The tool does NOT guess — the caller (typically an LLM) is expected to supply the real-world size from common-sense knowledge of the object type. Example: for a standard top-freezer fridge, pass \`height_m: 1.8\`.
+
+Pass only the dimension(s) you have strong prior knowledge about:
+  • Single dim (e.g. \`{ height_m: 1.8 }\`): factor derived from that axis; other axes follow the GLB's aspect ratio. Recommended when you want to trust the generator's proportions.
+  • Multiple dims: the tool computes factors from each, and uses the factor from the LARGEST target dimension (usually the "headline" size). If the implied factors disagree by more than 5 %, a warning flags aspect-ratio mismatch between the generated 3D and the real-world proportions — consider regenerating the 3D rather than silently accepting the mismatch.
+
+Units: meters (m). Standard for OpenUSD, Isaac Sim, Omniverse, URDF, and ROS.
+
+Returns the scaled GLB path + URL, the applied factor, original and final bbox sizes, and any warnings.`,
+    {
+      glb_path: z.string().describe('Absolute path to the GLB to scale.'),
+      width_m: z
+        .number()
+        .positive()
+        .optional()
+        .describe('Target real-world width in meters (X axis). Optional.'),
+      height_m: z
+        .number()
+        .positive()
+        .optional()
+        .describe('Target real-world height in meters (Y axis). Optional.'),
+      depth_m: z
+        .number()
+        .positive()
+        .optional()
+        .describe('Target real-world depth in meters (Z axis). Optional.'),
+    },
+    async (params) => {
+      try {
+        const result = await scaleModel({
+          glb_path: params.glb_path,
+          width_m: params.width_m,
+          height_m: params.height_m,
+          depth_m: params.depth_m,
+        });
+        const lines: string[] = [
+          'Model scaled successfully.',
+          '',
+          `File: ${result.output_path}`,
+        ];
+        const url = makeFileUrl(result.output_path);
+        if (url) lines.push(`URL: ${url}`);
+        lines.push(`Asset ID: ${result.asset_id}`);
+        lines.push(`Applied factor: ${result.applied_factor.toFixed(4)}`);
+        lines.push(
+          `Original size (m): ${result.original_size_m
+            .map((v) => v.toFixed(4))
+            .join(' × ')}`,
+        );
+        lines.push(
+          `Final size (m): ${result.final_size_m
+            .map((v) => v.toFixed(4))
+            .join(' × ')}`,
+        );
+        lines.push(`Source: ${result.source}`);
+        if (result.warnings.length > 0) {
+          lines.push('', 'Warnings:');
+          for (const w of result.warnings) lines.push(`  - ${w}`);
+        }
+        return {
+          content: [{ type: 'text' as const, text: lines.join('\n') }],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: `Error scaling model: ${msg}` }],
           isError: true,
         };
       }
