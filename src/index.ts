@@ -34,6 +34,7 @@ import {
 } from './export-articulation.js';
 import { serveFileIfMatch } from './file-serving.js';
 import { buildPublicUrlBase, requestContext, makeFileUrl } from './request-context.js';
+import { sessionBus, type SessionEvent } from './event-bus.js';
 
 // ---------------------------------------------------------------------------
 // Server factory — each HTTP request in stateless mode gets a fresh server,
@@ -791,11 +792,108 @@ async function startStdio(): Promise<void> {
   await server.connect(transport);
 }
 
+// CORS preset shared by /api/* live-stream endpoints. We allow any origin
+// so a Phidias / Architect frontend served from a different host:port can
+// subscribe directly. If you tighten this to a whitelist, also tighten
+// the file server (otherwise the SSE event_url metadata is unreachable).
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+};
+
+function authorize(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  token: string | undefined,
+): boolean {
+  if (!token) return true;
+  // EventSource (browser) cannot set custom headers, so /api/* also
+  // accepts ?token=<token> as a fallback. /mcp keeps the strict header
+  // requirement because tool calls go through StreamableHTTP, not SSE.
+  const auth = req.headers.authorization;
+  if (auth === `Bearer ${token}`) return true;
+  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'local'}`);
+  if (url.searchParams.get('token') === token) return true;
+  res.writeHead(401, { 'Content-Type': 'application/json', ...CORS_HEADERS });
+  res.end(
+    JSON.stringify({ error: 'Unauthorized: missing or invalid bearer token' }),
+  );
+  return false;
+}
+
 async function startHttp(port: number, host: string, token: string | undefined): Promise<void> {
   const httpServer = http.createServer(async (req, res) => {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, CORS_HEADERS);
+      res.end();
+      return;
+    }
+
     if (req.url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.writeHead(200, { 'Content-Type': 'application/json', ...CORS_HEADERS });
       res.end(JSON.stringify({ status: 'ok', server: 'phidias-mcp-headless' }));
+      return;
+    }
+
+    // ─── Live event stream + initial state for frontends ─────────────────
+    if (req.url && (req.url === '/api/session/assets' || req.url.startsWith('/api/session/assets?'))) {
+      if (!authorize(req, res, token)) return;
+      const publicUrlBase = buildPublicUrlBase(req);
+      const assets = requestContext.run({ publicUrlBase }, () => {
+        return getSessionAssets().map((a) => ({
+          asset_id: a.id,
+          asset_type: a.type,
+          file_path: a.filePath,
+          file_url: makeFileUrl(a.filePath),
+          source_image_path: a.sourceImagePath,
+          prompt: a.prompt,
+          created_at: a.createdAt,
+        }));
+      });
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        ...CORS_HEADERS,
+      });
+      res.end(JSON.stringify({ assets }));
+      return;
+    }
+
+    if (req.url && (req.url === '/api/events/stream' || req.url.startsWith('/api/events/stream?'))) {
+      if (!authorize(req, res, token)) return;
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no', // disable proxy buffering for instant push
+        ...CORS_HEADERS,
+      });
+      res.write(': connected\n\n');
+
+      const handler = (evt: SessionEvent) => {
+        try {
+          res.write(`event: ${evt.event}\n`);
+          res.write(`data: ${JSON.stringify(evt)}\n\n`);
+        } catch {
+          // socket closed — listener is removed in 'close' handler
+        }
+      };
+      sessionBus.on('event', handler);
+
+      // Heartbeat every 25s so reverse proxies (and overzealous
+      // network middleboxes) don't kill the idle connection.
+      const ping = setInterval(() => {
+        try {
+          res.write(': ping\n\n');
+        } catch {
+          /* noop */
+        }
+      }, 25_000);
+
+      req.on('close', () => {
+        clearInterval(ping);
+        sessionBus.off('event', handler);
+      });
       return;
     }
 
@@ -804,7 +902,7 @@ async function startHttp(port: number, host: string, token: string | undefined):
 
     if (!req.url || !req.url.startsWith('/mcp')) {
       res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end('Not found. MCP endpoint is at /mcp, files at /files/<name>');
+      res.end('Not found. MCP endpoint is at /mcp, files at /files/<name>, live stream at /api/events/stream');
       return;
     }
 

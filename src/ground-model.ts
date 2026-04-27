@@ -140,13 +140,23 @@ export async function groundModel(
   ];
 
   const assetId = `grounded_${Date.now()}`;
-  trackSessionAsset({
-    id: assetId,
-    type: 'model',
-    filePath: outputPath,
-    sourceImagePath: params.glb_path,
-    createdAt: new Date().toISOString(),
-  });
+  trackSessionAsset(
+    {
+      id: assetId,
+      type: 'model',
+      filePath: outputPath,
+      sourceImagePath: params.glb_path,
+      createdAt: new Date().toISOString(),
+    },
+    {
+      tool: 'phidias.ground_model',
+      name: 'grounded',
+      metadata: {
+        translation: [dx, dy, dz],
+        center_xz: centerXZ,
+      },
+    },
+  );
 
   return {
     output_path: outputPath,

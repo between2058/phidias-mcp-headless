@@ -189,13 +189,24 @@ export async function scaleModel(
   ];
 
   const assetId = `scaled_${Date.now()}`;
-  trackSessionAsset({
-    id: assetId,
-    type: 'model',
-    filePath: outputPath,
-    sourceImagePath: params.glb_path,
-    createdAt: new Date().toISOString(),
-  });
+  trackSessionAsset(
+    {
+      id: assetId,
+      type: 'model',
+      filePath: outputPath,
+      sourceImagePath: params.glb_path,
+      createdAt: new Date().toISOString(),
+    },
+    {
+      tool: 'phidias.scale_model',
+      name: 'scaled',
+      metadata: {
+        applied_factor: finalFactor,
+        original_size_m: originalSize,
+        final_size_m: finalSize,
+      },
+    },
+  );
 
   return {
     output_path: outputPath,

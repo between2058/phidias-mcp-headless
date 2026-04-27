@@ -6,6 +6,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { sessionBus, type AssetType } from './event-bus.js';
+import { makeFileUrl } from './request-context.js';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -47,8 +49,36 @@ export function findAssetById(id: string): GeneratedAsset | undefined {
   return sessionAssets.find((a) => a.id === id);
 }
 
-export function trackSessionAsset(asset: GeneratedAsset): void {
+// Optional richer hints supplied by callers — used to derive the
+// frontend-facing asset event without changing the existing GeneratedAsset
+// shape (which already lives in too many call sites to widen casually).
+export interface TrackOptions {
+  asset_type?: AssetType;     // override the default 'image'/'model' inferred from GeneratedAsset.type
+  name?: string;              // human-readable display name
+  source_asset_id?: string;   // chain back to upstream asset
+  tool?: string;              // e.g. "phidias.scale_model"
+  metadata?: Record<string, unknown>;
+}
+
+export function trackSessionAsset(asset: GeneratedAsset, opts: TrackOptions = {}): void {
   sessionAssets.push(asset);
+  // Best-effort live broadcast. Never block the tool flow on bus errors.
+  try {
+    sessionBus.emitEvent({
+      event: 'asset.created',
+      asset_id: asset.id,
+      asset_type: opts.asset_type ?? asset.type,
+      name: opts.name ?? path.basename(asset.filePath),
+      file_url: makeFileUrl(asset.filePath),
+      file_path: asset.filePath,
+      source_asset_id: opts.source_asset_id,
+      tool: opts.tool ?? 'phidias.unknown',
+      metadata: opts.metadata,
+      timestamp: asset.createdAt,
+    });
+  } catch {
+    // ignore — event delivery is best-effort, tool result is the source of truth
+  }
 }
 
 export function getOutputDir(): string {
@@ -172,9 +202,17 @@ export async function generateImage(
     createdAt: new Date().toISOString(),
     backendRequestId: downloadId,
   };
-  sessionAssets.push(asset);
+  trackSessionAsset(asset, {
+    tool: 'phidias.generate_image',
+    name: 'reference_image',
+    metadata: { prompt },
+  });
 
   return asset;
+}
+
+function lookupAssetIdByPath(filePath: string): string | undefined {
+  return sessionAssets.find((a) => a.filePath === filePath)?.id;
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +382,11 @@ export async function generate3D(
     createdAt: new Date().toISOString(),
     backendRequestId: requestId,
   };
-  sessionAssets.push(asset);
+  trackSessionAsset(asset, {
+    tool: 'phidias.generate_3d',
+    name: 'raw_model',
+    source_asset_id: lookupAssetIdByPath(imagePath),
+  });
 
   return asset;
 }
@@ -472,7 +514,12 @@ export async function segment3D(
     createdAt: new Date().toISOString(),
     backendRequestId: downloadId,
   };
-  sessionAssets.push(asset);
+  trackSessionAsset(asset, {
+    tool: 'phidias.segment_model',
+    name: 'segmented',
+    source_asset_id: lookupAssetIdByPath(glbPath),
+    metadata: { num_parts: result.num_parts },
+  });
 
   return {
     filePath: outputPath,

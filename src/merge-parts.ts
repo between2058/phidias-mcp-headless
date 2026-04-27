@@ -421,13 +421,19 @@ export async function mergeParts(params: MergePartsParams): Promise<MergePartsRe
   await io.write(outputPath, doc);
 
   const assetId = `merged_${Date.now()}`;
-  trackSessionAsset({
-    id: assetId,
-    type: 'model',
-    filePath: outputPath,
-    sourceImagePath: params.glb_path,
-    createdAt: new Date().toISOString(),
-  });
+  trackSessionAsset(
+    {
+      id: assetId,
+      type: 'model',
+      filePath: outputPath,
+      sourceImagePath: params.glb_path,
+      createdAt: new Date().toISOString(),
+    },
+    {
+      tool: 'phidias.merge_parts',
+      name: 'merged',
+    },
+  );
 
   return {
     output_path: outputPath,

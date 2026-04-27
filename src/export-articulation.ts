@@ -561,13 +561,25 @@ export async function exportArticulation(
   fs.writeFileSync(outputPath, fileBuffer);
 
   const assetId = `articulation_${Date.now()}`;
-  trackSessionAsset({
-    id: assetId,
-    type: 'model',
-    filePath: outputPath,
-    sourceImagePath: params.glb_path,
-    createdAt: new Date().toISOString(),
-  });
+  trackSessionAsset(
+    {
+      id: assetId,
+      type: 'model',
+      filePath: outputPath,
+      sourceImagePath: params.glb_path,
+      createdAt: new Date().toISOString(),
+    },
+    {
+      tool: 'phidias.export_articulation',
+      asset_type: params.format === 'usdz' ? 'usdz' : 'usda',
+      name: params.model_name,
+      metadata: {
+        format: params.format,
+        parts_count: params.parts.length,
+        joints_count: params.joints.length,
+      },
+    },
+  );
 
   // Post-step: produce a phidias.physics.v1 JSON for the frontend Physics
   // Editor's "Import Config" button. The parser needs the stage as text USDA;
@@ -623,13 +635,22 @@ export async function exportArticulation(
       fs.writeFileSync(jsonOut, JSON.stringify(physicsJson, null, 2));
       physicsJsonPath = jsonOut;
       physicsJsonAssetId = `physics_${Date.now()}`;
-      trackSessionAsset({
-        id: physicsJsonAssetId,
-        type: 'model',
-        filePath: jsonOut,
-        sourceImagePath: outputPath,
-        createdAt: new Date().toISOString(),
-      });
+      trackSessionAsset(
+        {
+          id: physicsJsonAssetId,
+          type: 'model',
+          filePath: jsonOut,
+          sourceImagePath: outputPath,
+          createdAt: new Date().toISOString(),
+        },
+        {
+          tool: 'phidias.export_articulation',
+          asset_type: 'physics_config',
+          name: `${params.model_name}.physics.json`,
+          source_asset_id: assetId,
+          metadata: { schema: 'phidias.physics.v1' },
+        },
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       warnings.push(`physics JSON generation failed: ${msg}`);
