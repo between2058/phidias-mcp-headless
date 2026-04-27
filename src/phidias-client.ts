@@ -31,7 +31,15 @@ if (!fs.existsSync(OUTPUT_DIR)) {
 
 export interface GeneratedAsset {
   id: string;
+  /** Coarse type used by legacy callers and the asset-tracking ledger. */
   type: 'image' | 'model';
+  /**
+   * Finer-grained type for downstream consumers (frontend SSE / snapshot
+   * subscribers): distinguishes 'usdz' / 'usda' / 'physics_config' from
+   * plain 'model' so a viewer doesn't try to feed a USDZ to GLTFLoader.
+   * Falls back to `type` when not set.
+   */
+  assetType?: AssetType;
   filePath: string;
   prompt?: string;
   sourceImagePath?: string;
@@ -61,13 +69,16 @@ export interface TrackOptions {
 }
 
 export function trackSessionAsset(asset: GeneratedAsset, opts: TrackOptions = {}): void {
+  // Persist the override so /api/session/assets snapshots see the same
+  // fine-grained asset_type that live SSE listeners get.
+  if (opts.asset_type) asset.assetType = opts.asset_type;
   sessionAssets.push(asset);
   // Best-effort live broadcast. Never block the tool flow on bus errors.
   try {
     sessionBus.emitEvent({
       event: 'asset.created',
       asset_id: asset.id,
-      asset_type: opts.asset_type ?? asset.type,
+      asset_type: asset.assetType ?? asset.type,
       name: opts.name ?? path.basename(asset.filePath),
       file_url: makeFileUrl(asset.filePath),
       file_path: asset.filePath,

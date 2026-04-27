@@ -843,7 +843,10 @@ async function startHttp(port: number, host: string, token: string | undefined):
       const assets = requestContext.run({ publicUrlBase }, () => {
         return getSessionAssets().map((a) => ({
           asset_id: a.id,
-          asset_type: a.type,
+          // Prefer the fine-grained override (set by tools that produce
+          // USDZ / USDA / physics_config) so the frontend snapshot matches
+          // what live SSE listeners see.
+          asset_type: a.assetType ?? a.type,
           file_path: a.filePath,
           file_url: makeFileUrl(a.filePath),
           source_image_path: a.sourceImagePath,
