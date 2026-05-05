@@ -32,7 +32,7 @@ import {
   exportArticulation,
   MATERIAL_PRESET_KEYS,
 } from './export-articulation.js';
-import { uploadImage } from './upload-image.js';
+import { uploadImage, saveImageBuffer } from './upload-image.js';
 import { serveFileIfMatch } from './file-serving.js';
 import { buildPublicUrlBase, requestContext, makeFileUrl } from './request-context.js';
 import { sessionBus, type SessionEvent } from './event-bus.js';
@@ -108,11 +108,19 @@ function createServer(): McpServer {
 
   server.tool(
     'upload_image',
-    'Upload a base64-encoded image (PNG/JPEG/WEBP) supplied by the user as the reference image for the 3D pipeline. Use this when the user provides their own image instead of generating one with generate_image. Returns a file path that generate_3d can consume directly.',
+    `Upload a base64-encoded image (PNG/JPEG/WEBP) as the reference for the 3D pipeline. Use this only for tiny images (< ~10 KB raw / < ~14 KB base64) that are already in the agent's context.
+
+⚠️ FOR ANY REAL IMAGE FILE ON DISK, DO NOT USE THIS TOOL — Claude Code's Bash tool truncates command output, so piping \`base64 < photo.png\` into image_data corrupts the file silently. Instead, upload via the HTTP endpoint:
+
+  curl --data-binary @/path/to/photo.png \\
+       -H "Content-Type: image/png" \\
+       "<server-base-url>/api/upload?filename=photo.png"
+
+The response is JSON { asset_id, file_path, file_url } and file_path can be passed straight to generate_3d. The server base URL is the same one returned by other tools' bridge URLs.`,
     {
-      image_data: z.string().describe('The image as a base64 string. May include the "data:image/...;base64," prefix; it will be stripped automatically. Max ~20 MB decoded.'),
-      filename: z.string().optional().describe('Original filename for display only (e.g. "my-cabinet.png"). Used to derive the saved filename; not required.'),
-      note: z.string().optional().describe('Optional human-readable note about what this image is for. Surfaced in the Agent Live event metadata.'),
+      image_data: z.string().describe('The image as a base64 string. May include the "data:image/...;base64," prefix. Use only for tiny images already in the agent context — for files on disk use POST /api/upload.'),
+      filename: z.string().optional().describe('Original filename for display only.'),
+      note: z.string().optional().describe('Optional human-readable note about this image.'),
     },
     async (params) => {
       try {
@@ -944,12 +952,73 @@ async function startHttp(port: number, host: string, token: string | undefined):
       return;
     }
 
+    // ─── Image upload (raw body, avoids tool-param size limits) ──────────
+    if (req.url && req.method === 'POST' && (req.url === '/api/upload' || req.url.startsWith('/api/upload?'))) {
+      if (!authorize(req, res, token)) return;
+
+      const url = new URL(req.url, `http://${req.headers.host ?? 'local'}`);
+      const filename = url.searchParams.get('filename') ?? undefined;
+      const note = url.searchParams.get('note') ?? undefined;
+
+      const MAX_BYTES = 50 * 1024 * 1024;
+      const chunks: Buffer[] = [];
+      let received = 0;
+      let aborted = false;
+
+      req.on('data', (chunk: Buffer) => {
+        if (aborted) return;
+        received += chunk.length;
+        if (received > MAX_BYTES) {
+          aborted = true;
+          res.writeHead(413, { 'Content-Type': 'application/json', ...CORS_HEADERS });
+          res.end(JSON.stringify({ error: `payload too large (limit ${MAX_BYTES})` }));
+          req.destroy();
+          return;
+        }
+        chunks.push(chunk);
+      });
+
+      req.on('end', () => {
+        if (aborted) return;
+        try {
+          const buf = Buffer.concat(chunks);
+          const publicUrlBase = buildPublicUrlBase(req);
+          const asset = requestContext.run({ publicUrlBase }, () =>
+            saveImageBuffer(buf, {
+              filename,
+              note,
+              tool: 'phidias.upload_image_http',
+            }),
+          );
+          res.writeHead(200, { 'Content-Type': 'application/json', ...CORS_HEADERS });
+          res.end(JSON.stringify({
+            asset_id: asset.id,
+            file_path: asset.filePath,
+            file_url: requestContext.run({ publicUrlBase }, () => makeFileUrl(asset.filePath)),
+          }));
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          res.writeHead(400, { 'Content-Type': 'application/json', ...CORS_HEADERS });
+          res.end(JSON.stringify({ error: msg }));
+        }
+      });
+
+      req.on('error', () => {
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json', ...CORS_HEADERS });
+          res.end(JSON.stringify({ error: 'request stream error' }));
+        }
+      });
+
+      return;
+    }
+
     // File retrieval (same auth posture as /mcp)
     if (serveFileIfMatch(req, res, token)) return;
 
     if (!req.url || !req.url.startsWith('/mcp')) {
       res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end('Not found. MCP endpoint is at /mcp, files at /files/<name>, live stream at /api/events/stream');
+      res.end('Not found. MCP endpoint is at /mcp, files at /files/<name>, live stream at /api/events/stream, upload at POST /api/upload');
       return;
     }
 
