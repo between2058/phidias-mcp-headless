@@ -75,7 +75,7 @@ export interface ExportPart {
   mobility?: 'fixed' | 'revolute' | 'prismatic';
   mass?: number | null;
   density?: number;
-  center_of_mass?: [number, number, number] | null;
+  center_of_mass?: number[] | null;
   collision_type?: 'mesh' | 'convexHull' | 'convexDecomposition' | 'none';
   static_friction?: number;
   dynamic_friction?: number;
@@ -88,8 +88,8 @@ export interface ExportJoint {
   parent: string;
   child: string;
   type?: 'fixed' | 'revolute' | 'prismatic';
-  axis?: [number, number, number];
-  anchor?: [number, number, number];
+  axis?: number[];
+  anchor?: number[];
   lower_limit?: number | null;
   upper_limit?: number | null;
   drive_stiffness?: number | null;
@@ -475,8 +475,8 @@ export async function exportArticulation(
     if (!childG?.worldCentroid || !parentG?.worldCentroid) return j;
     const analysis = analyzeJointDirection({
       jointType: type,
-      axis: j.axis ?? [0, 0, 1],
-      anchor: j.anchor ?? [0, 0, 0],
+      axis: (j.axis ?? [0, 0, 1]) as Vec3,
+      anchor: (j.anchor ?? [0, 0, 0]) as Vec3,
       childCentroid: childG.worldCentroid,
       parentCentroid: parentG.worldCentroid,
     });
