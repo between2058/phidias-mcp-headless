@@ -1,19 +1,15 @@
 /**
- * upload_image tool — accept an image supplied by the MCP caller and persist
- * it to the same OUTPUT_DIR used by generate_image, so downstream tools
- * (generate_3d, etc.) can consume the resulting filePath without any code
- * changes.
+ * Image upload helper — used by the HTTP POST /api/upload endpoint to
+ * persist a user-supplied image into OUTPUT_DIR with the same id format
+ * and SSE event broadcast as generate_image, so downstream tools
+ * (generate_3d, etc.) consume the file path unchanged.
  *
- * Two intake paths share `saveImageBuffer`:
+ * Scope: images only (PNG / JPEG / WEBP). GLB uploads will reuse the same
+ * endpoint with a different validator once we need it.
  *
- *  1. MCP tool: agent passes base64 string (small images only, see warning
- *     below).
- *  2. HTTP POST /api/upload: agent streams raw bytes via `curl --data-binary`.
- *     This avoids the Bash-output truncation that breaks any non-trivial
- *     image when going through the MCP tool param path.
- *
- * Scope: images only (PNG / JPEG / WEBP). GLB uploads will use the same
- * /api/upload endpoint with a different validator once we need it.
+ * The MCP `upload_image` tool is a redirector — it returns the curl recipe
+ * for the agent to run, since image bytes can't fit reliably through
+ * MCP tool parameters.
  */
 
 import fs from 'node:fs';
@@ -103,39 +99,3 @@ export function saveImageBuffer(buf: Buffer, opts: SaveImageOptions): GeneratedA
   return asset;
 }
 
-// ---------------------------------------------------------------------------
-// MCP tool entry point: base64 in tool param.
-//
-// WARNING: Claude Code's Bash tool truncates command output well below 1 MB,
-// so a workflow like `Bash("base64 < photo.png")` → tool param will silently
-// corrupt anything beyond ~kilobytes. For real uploads, agents should use
-// the HTTP /api/upload endpoint via curl. This tool is kept only as a
-// fallback for tiny images already in the agent's context.
-// ---------------------------------------------------------------------------
-
-export interface UploadImageInput {
-  image_data: string;
-  filename?: string;
-  note?: string;
-}
-
-export async function uploadImage(input: UploadImageInput): Promise<GeneratedAsset> {
-  if (!input.image_data || typeof input.image_data !== 'string') {
-    throw new Error('image_data is required and must be a base64 string');
-  }
-
-  const b64 = input.image_data.replace(/^data:image\/[a-zA-Z+.-]+;base64,/, '');
-
-  let buf: Buffer;
-  try {
-    buf = Buffer.from(b64, 'base64');
-  } catch {
-    throw new Error('image_data is not valid base64');
-  }
-
-  return saveImageBuffer(buf, {
-    filename: input.filename,
-    note: input.note,
-    tool: 'phidias.upload_image',
-  });
-}
