@@ -55,12 +55,12 @@ function createServer(): McpServer {
 
   server.tool(
     'generate_image',
-    'Generate a reference image from a text prompt using Qwen AI. Returns the file path of the generated image. Use this as the first step to create a 3D model — generate a concept image, then pass it to generate_3d.',
+    'Generate a reference image from a text prompt. Returns the file path of the generated image. Use this as the first step to create a 3D model — generate a concept image, then pass it to generate_3d.',
     {
       prompt: z.string().describe('Text description of the image to generate (English recommended). Be specific about the subject, style, and viewing angle. For 3D model creation, include "front view" or "3/4 view" for best results.'),
       negative_prompt: z.string().optional().describe('Things to exclude from the image (e.g. "blurry, low quality, distorted")'),
       seed: z.number().int().optional().describe('Random seed for reproducibility. Omit for random results.'),
-      num_steps: z.number().int().min(1).max(100).optional().describe('Number of diffusion steps (default: 50). Higher = better quality but slower.'),
+      num_steps: z.number().int().min(1).max(100).default(25).describe('Number of diffusion steps (default: 25). Higher = better quality but slower.'),
       cfg_scale: z.number().min(0).max(20).optional().describe('CFG scale controlling prompt adherence (default: 4.0). Higher = more literal.'),
       aspect_ratio: z.enum(['1:1', '16:9', '9:16', '4:3', '3:4']).optional().describe('Image aspect ratio (default: 1:1). Use 1:1 for 3D model reference images.'),
     },
@@ -206,13 +206,9 @@ The URL must be reachable from the MCP server. Common sources: presigned cloud-s
 
   server.tool(
     'generate_3d',
-    `Generate a textured 3D model (GLB) from a reference image. Two backends available:
-- trellis2 (default): HIGH QUALITY, detailed topology, high face count. Slower (~3min). Use for final assets or when quality matters.
-- reconviagen: FAST (~1min), lower detail. Use for quick previews or rapid iteration.
-If the user hasn't specified which backend to use, ask them. Returns the file path of the generated GLB.`,
+    `Generate a textured 3D model (GLB) from a reference image (~1 min). Returns the file path of the generated GLB.`,
     {
       image_path: z.string().describe('Absolute file path to the reference image (PNG/JPG). Can be a path from generate_image output or any local image file.'),
-      backend: z.enum(['trellis2', 'reconviagen']).default('trellis2').describe('Which 3D generation backend to use. trellis2 = high quality/slow, reconviagen = fast/preview.'),
       seed: z.number().int().optional().describe('Random seed for reproducibility. Omit for random results.'),
       texture_size: z.number().int().optional().describe('Texture resolution (default: 1024). Options: 512, 1024, 2048. Higher = more detailed textures but larger file.'),
       ss_guidance_strength: z.number().optional().describe('Structure guidance strength (default: 7.5). Controls how closely the 3D shape follows the image.'),
@@ -223,7 +219,7 @@ If the user hasn't specified which backend to use, ask them. Returns the file pa
     async (params) => {
       try {
         const asset = await generate3D(params.image_path, {
-          backend: params.backend,
+          backend: 'reconviagen',
           seed: params.seed,
           texture_size: params.texture_size,
           ss_guidance_strength: params.ss_guidance_strength,
@@ -233,7 +229,7 @@ If the user hasn't specified which backend to use, ask them. Returns the file pa
         });
 
         const lines: string[] = [
-          `3D model generated successfully (${params.backend}).`,
+          '3D model generated successfully.',
           '',
           `File: ${asset.filePath}`,
         ];
@@ -261,11 +257,11 @@ If the user hasn't specified which backend to use, ask them. Returns the file pa
 
   server.tool(
     'segment_model',
-    'Segment a 3D model (GLB) into individual parts using P3-SAM AI. Splits a single mesh into meaningful parts (e.g. head, body, legs, arms). Takes 1-3 minutes. Returns the file path of the segmented GLB and the number of parts.',
+    'Segment a 3D model (GLB) into individual parts. Splits a single mesh into meaningful parts (e.g. head, body, legs, arms). Takes 1-3 minutes. Returns the file path of the segmented GLB and the number of parts.',
     {
       glb_path: z.string().describe('Absolute path to a GLB file to segment.'),
-      point_num: z.number().int().min(1000).max(20000).optional().describe('Number of sample points (P3-SAM backend requires >= 1000; default: backend default).'),
-      prompt_num: z.number().int().min(10).max(200).optional().describe('Number of prompts for segmentation (P3-SAM backend requires >= 10; default: backend default).'),
+      point_num: z.number().int().min(1000).max(20000).optional().describe('Number of sample points (must be >= 1000; default: backend default).'),
+      prompt_num: z.number().int().min(10).max(200).optional().describe('Number of prompts for segmentation (must be >= 10; default: backend default).'),
       threshold: z.number().min(0).max(1).optional().describe('Segmentation threshold (default: 0.5). Lower = more parts, higher = fewer parts.'),
       seed: z.number().int().optional().describe('Random seed for reproducibility.'),
     },
@@ -499,7 +495,7 @@ Call inspect_model first to see indices, then decide which clusters to merge. Ty
 
   server.tool(
     'scale_model',
-    `Uniformly scale a GLB so its bounding box matches one or more real-world physical dimensions in meters. The 3D generation backends (trellis2, reconviagen) output models normalised to a unit-ish bbox ([-0.5, 0.5]), which means Isaac Sim / Omniverse / any USD-aware physics consumer loads everything at the same size. Run this before export_articulation so the emitted USDZ and phidias.physics.v1 JSON are at physically accurate scale.
+    `Uniformly scale a GLB so its bounding box matches one or more real-world physical dimensions in meters. The generate_3d output is normalised to a unit-ish bbox ([-0.5, 0.5]), which means Isaac Sim / Omniverse / any USD-aware physics consumer loads everything at the same size. Run this before export_articulation so the emitted USDZ and phidias.physics.v1 JSON are at physically accurate scale.
 
 Only a single uniform scale factor is applied — the model's aspect ratio is preserved. Per-axis scaling would distort geometry (a wheel becoming oval) and is deliberately NOT supported.
 
