@@ -32,7 +32,7 @@ import {
   exportArticulation,
   MATERIAL_PRESET_KEYS,
 } from './export-articulation.js';
-import { saveImageBuffer } from './upload-image.js';
+import { uploadImage, saveImageBuffer } from './upload-image.js';
 import { serveFileIfMatch } from './file-serving.js';
 import { buildPublicUrlBase, requestContext, makeFileUrl } from './request-context.js';
 import { sessionBus, type SessionEvent } from './event-bus.js';
@@ -108,50 +108,48 @@ function createServer(): McpServer {
 
   server.tool(
     'upload_image',
-    `Register a user-supplied reference image (on the agent's local disk) into the Phidias pipeline. This tool DOES NOT carry the image bytes itself — image data cannot fit through MCP tool parameters reliably (Claude Code's Bash output is truncated, base64 in tool params is also size-limited, and large images get silently corrupted).
+    `Upload a base64-encoded image (PNG/JPEG/WEBP) as the reference for the 3D pipeline. Use this only for tiny images (< ~10 KB raw / < ~14 KB base64) that are already in the agent's context.
 
-Instead, this tool returns a single shell command for the agent to run via Bash. That command streams the file to the MCP server and prints the resulting file_path. The agent then passes file_path to generate_3d.
+⚠️ FOR ANY REAL IMAGE FILE ON DISK, DO NOT USE THIS TOOL — Claude Code's Bash tool truncates command output, so piping \`base64 < photo.png\` into image_data corrupts the file silently. Instead, upload via the HTTP endpoint:
 
-Usage:
-  1. Call upload_image with source_path = absolute local path of the image.
-  2. Run the returned curl command with Bash. The command's stdout is JSON { asset_id, file_path, file_url }.
-  3. Pass file_path to generate_3d.`,
+  curl --data-binary @/path/to/photo.png \\
+       -H "Content-Type: image/png" \\
+       "<server-base-url>/api/upload?filename=photo.png"
+
+The response is JSON { asset_id, file_path, file_url } and file_path can be passed straight to generate_3d. The server base URL is the same one returned by other tools' bridge URLs.`,
     {
-      source_path: z.string().describe('Absolute local path of the image file on the agent\'s machine (e.g. "/Users/me/photo.png"). Must exist on the machine running the agent, NOT on the MCP server.'),
-      filename: z.string().optional().describe('Optional display name. Defaults to basename of source_path.'),
-      note: z.string().optional().describe('Optional human note carried into the Agent Live event metadata.'),
+      image_data: z.string().describe('The image as a base64 string. May include the "data:image/...;base64," prefix. Use only for tiny images already in the agent context — for files on disk use POST /api/upload.'),
+      filename: z.string().optional().describe('Original filename for display only.'),
+      note: z.string().optional().describe('Optional human-readable note about this image.'),
     },
     async (params) => {
-      const base = requestContext.getStore()?.publicUrlBase;
-      const uploadUrl = base ? `${base}/api/upload` : '<server-base-url>/api/upload';
+      try {
+        const asset = await uploadImage(params);
 
-      const filenameParam = params.filename ?? params.source_path.split('/').pop() ?? 'upload.png';
-      const ext = filenameParam.toLowerCase().split('.').pop() ?? 'png';
-      const mime =
-        ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
-        : ext === 'webp' ? 'image/webp'
-        : 'image/png';
+        const base64Preview = fs.readFileSync(asset.filePath).toString('base64');
+        const textLines: string[] = [
+          'Image uploaded successfully.',
+          '',
+          `File: ${asset.filePath}`,
+        ];
+        const url = makeFileUrl(asset.filePath);
+        if (url) textLines.push(`URL: ${url}`);
+        textLines.push(`Asset ID: ${asset.id}`);
+        textLines.push('', 'Next step: Use generate_3d with this image path to create a 3D model.');
 
-      const qs = new URLSearchParams({ filename: filenameParam });
-      if (params.note) qs.set('note', params.note);
-
-      const curlCmd =
-        `curl -sS --data-binary @${params.source_path} ` +
-        `-H "Content-Type: ${mime}" ` +
-        `"${uploadUrl}?${qs.toString()}"`;
-
-      const text = [
-        'Run the following command via Bash to upload the image:',
-        '',
-        curlCmd,
-        '',
-        'The stdout is JSON: { "asset_id": "...", "file_path": "...", "file_url": "..." }.',
-        'Pass file_path directly to generate_3d.',
-      ].join('\n');
-
-      return {
-        content: [{ type: 'text' as const, text }],
-      };
+        return {
+          content: [
+            { type: 'image' as const, data: base64Preview, mimeType: 'image/png' },
+            { type: 'text' as const, text: textLines.join('\n') },
+          ],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: `Error uploading image: ${msg}` }],
+          isError: true,
+        };
+      }
     },
   );
 
