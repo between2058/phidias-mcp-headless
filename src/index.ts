@@ -3,7 +3,7 @@
  * Phidias MCP Server (Headless)
  *
  * Exposes the Phidias 3D asset pipeline as MCP tools for Claude Code.
- * Tools: generate_image, generate_3d, segment_model, list_generated_assets
+ * Tools: generate_image, upload_image, generate_3d, segment_model, list_generated_assets
  *
  * Headless variant — no browser frontend, no WebSocket bridge.
  * All tools are pure backend operations that return file paths on disk.
@@ -32,6 +32,7 @@ import {
   exportArticulation,
   MATERIAL_PRESET_KEYS,
 } from './export-articulation.js';
+import { uploadImage } from './upload-image.js';
 import { serveFileIfMatch } from './file-serving.js';
 import { buildPublicUrlBase, requestContext, makeFileUrl } from './request-context.js';
 import { sessionBus, type SessionEvent } from './event-bus.js';
@@ -95,6 +96,49 @@ function createServer(): McpServer {
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: 'text' as const, text: `Error generating image: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Tool: upload_image
+  // -------------------------------------------------------------------------
+
+  server.tool(
+    'upload_image',
+    'Upload a base64-encoded image (PNG/JPEG/WEBP) supplied by the user as the reference image for the 3D pipeline. Use this when the user provides their own image instead of generating one with generate_image. Returns a file path that generate_3d can consume directly.',
+    {
+      image_data: z.string().describe('The image as a base64 string. May include the "data:image/...;base64," prefix; it will be stripped automatically. Max ~20 MB decoded.'),
+      filename: z.string().optional().describe('Original filename for display only (e.g. "my-cabinet.png"). Used to derive the saved filename; not required.'),
+      note: z.string().optional().describe('Optional human-readable note about what this image is for. Surfaced in the Agent Live event metadata.'),
+    },
+    async (params) => {
+      try {
+        const asset = await uploadImage(params);
+
+        const base64Preview = fs.readFileSync(asset.filePath).toString('base64');
+        const textLines: string[] = [
+          'Image uploaded successfully.',
+          '',
+          `File: ${asset.filePath}`,
+        ];
+        const url = makeFileUrl(asset.filePath);
+        if (url) textLines.push(`URL: ${url}`);
+        textLines.push(`Asset ID: ${asset.id}`);
+        textLines.push('', 'Next step: Use generate_3d with this image path to create a 3D model.');
+
+        return {
+          content: [
+            { type: 'image' as const, data: base64Preview, mimeType: 'image/png' },
+            { type: 'text' as const, text: textLines.join('\n') },
+          ],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: `Error uploading image: ${msg}` }],
           isError: true,
         };
       }
