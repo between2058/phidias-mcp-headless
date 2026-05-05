@@ -139,3 +139,86 @@ export async function uploadImage(input: UploadImageInput): Promise<GeneratedAss
     tool: 'phidias.upload_image',
   });
 }
+
+// ---------------------------------------------------------------------------
+// MCP tool entry point: server-side fetch from URL.
+//
+// For agent platforms that cannot run shell commands (and therefore cannot
+// curl the /api/upload endpoint) and cannot reliably pass large base64 blobs
+// through tool params. The agent provides a URL the server can reach; the
+// server downloads the bytes itself and reuses saveImageBuffer.
+// ---------------------------------------------------------------------------
+
+export interface UploadFromUrlInput {
+  url: string;
+  filename?: string;
+  note?: string;
+  timeout_ms?: number;
+}
+
+const URL_FETCH_DEFAULT_TIMEOUT_MS = 30_000;
+
+function deriveFilenameFromUrl(rawUrl: string): string | undefined {
+  try {
+    const u = new URL(rawUrl);
+    const last = u.pathname.split('/').filter(Boolean).pop();
+    return last ? decodeURIComponent(last) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function uploadImageFromUrl(input: UploadFromUrlInput): Promise<GeneratedAsset> {
+  if (!input.url || typeof input.url !== 'string') {
+    throw new Error('url is required');
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(input.url);
+  } catch {
+    throw new Error('url is not a valid URL');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`unsupported protocol "${parsed.protocol}" — only http(s) URLs are accepted`);
+  }
+
+  const controller = new AbortController();
+  const timeoutMs = input.timeout_ms && input.timeout_ms > 0
+    ? Math.min(input.timeout_ms, 5 * 60_000)
+    : URL_FETCH_DEFAULT_TIMEOUT_MS;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response: Response;
+  try {
+    response = await fetch(parsed.toString(), {
+      redirect: 'follow',
+      signal: controller.signal,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`failed to fetch url: ${msg}`);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!response.ok) {
+    throw new Error(`fetch failed: HTTP ${response.status} ${response.statusText}`);
+  }
+
+  const contentLength = Number(response.headers.get('content-length') ?? '0');
+  if (contentLength && contentLength > MAX_DECODED_BYTES) {
+    throw new Error(`remote image too large (content-length ${contentLength}, limit ${MAX_DECODED_BYTES})`);
+  }
+
+  const arrayBuf = await response.arrayBuffer();
+  const buf = Buffer.from(arrayBuf);
+
+  const filename = input.filename ?? deriveFilenameFromUrl(input.url);
+
+  return saveImageBuffer(buf, {
+    filename,
+    note: input.note,
+    tool: 'phidias.upload_from_url',
+  });
+}

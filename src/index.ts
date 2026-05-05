@@ -3,7 +3,7 @@
  * Phidias MCP Server (Headless)
  *
  * Exposes the Phidias 3D asset pipeline as MCP tools for Claude Code.
- * Tools: generate_image, upload_image, generate_3d, segment_model, list_generated_assets
+ * Tools: generate_image, upload_image, upload_from_url, generate_3d, segment_model, list_generated_assets
  *
  * Headless variant — no browser frontend, no WebSocket bridge.
  * All tools are pure backend operations that return file paths on disk.
@@ -32,7 +32,7 @@ import {
   exportArticulation,
   MATERIAL_PRESET_KEYS,
 } from './export-articulation.js';
-import { uploadImage, saveImageBuffer } from './upload-image.js';
+import { uploadImage, uploadImageFromUrl, saveImageBuffer } from './upload-image.js';
 import { serveFileIfMatch } from './file-serving.js';
 import { buildPublicUrlBase, requestContext, makeFileUrl } from './request-context.js';
 import { sessionBus, type SessionEvent } from './event-bus.js';
@@ -147,6 +147,53 @@ The response is JSON { asset_id, file_path, file_url } and file_path can be pass
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: 'text' as const, text: `Error uploading image: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Tool: upload_from_url
+  // -------------------------------------------------------------------------
+
+  server.tool(
+    'upload_from_url',
+    `Download an image (PNG/JPEG/WEBP) from a URL on the server side, save it into the asset pipeline, and return its file_path. Designed for agent platforms that cannot run shell commands (and therefore cannot curl /api/upload) and cannot reliably pass large base64 blobs through tool params.
+
+The URL must be reachable from the MCP server. Common sources: presigned cloud-storage URLs (S3/GCS/Azure), public CDNs, the host platform's own image storage, or any HTTP(S) URL the server can resolve. Follows redirects, 30s default timeout, 50 MB cap. Returns { file_path, asset_id, file_url } where file_path can be passed straight to generate_3d.`,
+    {
+      url: z.string().describe('HTTP or HTTPS URL of the image to fetch. Must be reachable from the MCP server.'),
+      filename: z.string().optional().describe('Original filename for display only. If omitted, derived from the URL path basename.'),
+      note: z.string().optional().describe('Optional human-readable note about this image.'),
+      timeout_ms: z.number().int().min(1000).max(300_000).optional().describe('Fetch timeout in milliseconds (default: 30000, max: 300000).'),
+    },
+    async (params) => {
+      try {
+        const asset = await uploadImageFromUrl(params);
+
+        const base64Preview = fs.readFileSync(asset.filePath).toString('base64');
+        const textLines: string[] = [
+          'Image fetched and uploaded successfully.',
+          '',
+          `File: ${asset.filePath}`,
+        ];
+        const url = makeFileUrl(asset.filePath);
+        if (url) textLines.push(`URL: ${url}`);
+        textLines.push(`Asset ID: ${asset.id}`);
+        textLines.push(`Source URL: ${params.url}`);
+        textLines.push('', 'Next step: Use generate_3d with this image path to create a 3D model.');
+
+        return {
+          content: [
+            { type: 'image' as const, data: base64Preview, mimeType: 'image/png' },
+            { type: 'text' as const, text: textLines.join('\n') },
+          ],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: `Error fetching image from URL: ${msg}` }],
           isError: true,
         };
       }
