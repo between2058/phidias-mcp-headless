@@ -97,6 +97,104 @@ export function getOutputDir(): string {
 }
 
 // ---------------------------------------------------------------------------
+// Seed assets — pre-staged files that should reappear after every restart.
+// ---------------------------------------------------------------------------
+
+const SEED_EXT_TO_TYPES: Record<string, { type: 'image' | 'model'; assetType: AssetType }> = {
+  '.glb':  { type: 'model', assetType: 'model' },
+  '.gltf': { type: 'model', assetType: 'model' },
+  '.usdz': { type: 'model', assetType: 'usdz' },
+  '.usda': { type: 'model', assetType: 'usda' },
+  '.png':  { type: 'image', assetType: 'image' },
+  '.jpg':  { type: 'image', assetType: 'image' },
+  '.jpeg': { type: 'image', assetType: 'image' },
+  '.webp': { type: 'image', assetType: 'image' },
+};
+
+function sanitizeSeedStem(name: string): string {
+  const cleaned = name.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60);
+  return cleaned || 'seed';
+}
+
+/**
+ * Stage seed assets from a persistent directory into the ephemeral
+ * OUTPUT_DIR (via symlink, falling back to copy) and register them in
+ * the in-memory session list so /api/session/assets and live SSE pick
+ * them up automatically. Asset IDs are stable (`seed_<stem>`) so chat
+ * references survive restarts.
+ */
+export function seedAssetsFromDir(seedDir: string): void {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(seedDir);
+  } catch (err) {
+    process.stderr.write(`[phidias-mcp] PHIDIAS_SEED_DIR not readable (${seedDir}): ${(err as Error).message}\n`);
+    return;
+  }
+
+  let seeded = 0;
+  for (const entry of entries) {
+    if (entry.startsWith('.')) continue;
+    const ext = path.extname(entry).toLowerCase();
+    const map = SEED_EXT_TO_TYPES[ext];
+    if (!map) continue;
+
+    const absSrc = path.resolve(seedDir, entry);
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(absSrc);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile()) continue;
+
+    const stem = sanitizeSeedStem(path.basename(entry, ext));
+    const id = `seed_${stem}`;
+    if (sessionAssets.some((a) => a.id === id)) continue;
+
+    const stagedName = `${id}${ext}`;
+    const stagedPath = path.join(OUTPUT_DIR, stagedName);
+
+    try {
+      // Best-effort remove of any prior symlink/file at the target so the
+      // re-create below is idempotent across restarts. Dangling symlinks
+      // need unlinkSync (existsSync follows the link and returns false).
+      try { fs.unlinkSync(stagedPath); } catch { /* not present, fine */ }
+      try {
+        fs.symlinkSync(absSrc, stagedPath);
+      } catch {
+        fs.copyFileSync(absSrc, stagedPath);
+      }
+    } catch (err) {
+      process.stderr.write(`[phidias-mcp] failed to stage seed ${entry}: ${(err as Error).message}\n`);
+      continue;
+    }
+
+    const asset: GeneratedAsset = {
+      id,
+      type: map.type,
+      assetType: map.assetType,
+      filePath: stagedPath,
+      createdAt: stat.mtime.toISOString(),
+    };
+    trackSessionAsset(asset, {
+      asset_type: map.assetType,
+      name: entry,
+      tool: 'phidias.seed',
+      metadata: {
+        original_path: absSrc,
+        size_bytes: stat.size,
+      },
+    });
+    seeded++;
+  }
+
+  if (seeded > 0) {
+    process.stderr.write(`[phidias-mcp] seeded ${seeded} asset(s) from ${seedDir}\n`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Qwen: Text-to-Image
 // ---------------------------------------------------------------------------
 

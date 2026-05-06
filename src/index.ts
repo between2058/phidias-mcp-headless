@@ -22,6 +22,7 @@ import {
   getSessionAssets,
   getOutputDir,
   findAssetById,
+  seedAssetsFromDir,
 } from './phidias-client.js';
 import { inspectGltf } from './inspect-model.js';
 import { applyPartNames } from './apply-part-names.js';
@@ -1143,6 +1144,11 @@ async function startHttp(port: number, host: string, token: string | undefined):
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  const seedDir = process.env.PHIDIAS_SEED_DIR;
+  if (seedDir && seedDir.trim().length > 0) {
+    seedAssetsFromDir(seedDir.trim());
+  }
+
   const rawPort = process.env.MCP_HTTP_PORT;
   if (rawPort) {
     const port = Number.parseInt(rawPort, 10);
