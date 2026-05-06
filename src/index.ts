@@ -43,11 +43,31 @@ import { sessionBus, type SessionEvent } from './event-bus.js';
 // ---------------------------------------------------------------------------
 
 function createServer(): McpServer {
-  const server = new McpServer({
-    name: 'phidias-headless',
-    version: '0.1.0',
-    description: 'Phidias 3D asset creation pipeline (headless) — generate images, 3D models, and segment meshes from the command line',
-  });
+  const server = new McpServer(
+    {
+      name: 'phidias-headless',
+      version: '0.1.0',
+      description: 'Phidias 3D asset creation pipeline (headless) — generate images, 3D models, and segment meshes from the command line',
+    },
+    {
+      instructions: `Phidias produces 3D assets at three different levels of completeness. Match the user's request to the right endpoint:
+
+- "image" / "concept" / "reference image"  → generate_image
+- "3D model" / "mesh" / "GLB"               → generate_3d
+- "sim-ready" / "physics-ready" / "articulated" / "Isaac Sim" / "Omniverse" / "USD(Z)" / "rigged for simulation"
+  → run the FULL pipeline, do not stop at segmentation:
+       generate_3d  (or start from an existing GLB)
+    →  scale_model  (real-world meters)
+    →  ground_model (centre / drop to floor)
+    →  segment_model
+    →  inspect_model (decide which fragments belong together)
+    →  merge_parts  (fuse fragments that should be one rigid body)
+    →  apply_part_names (give each rigid body a stable id)
+    →  export_articulation (USDA / USDZ + phidias.physics.v1 JSON)  ← THIS is the sim-ready endpoint
+
+A segmented GLB by itself is NOT sim-ready. If the user asked for "sim-ready" and you only ran segment_model, the task is unfinished — keep going through merge_parts, apply_part_names, and export_articulation.`,
+    },
+  );
 
   // -------------------------------------------------------------------------
   // Tool: generate_image
@@ -206,7 +226,9 @@ The URL must be reachable from the MCP server. Common sources: presigned cloud-s
 
   server.tool(
     'generate_3d',
-    `Generate a textured 3D model (GLB) from a reference image (~1 min). Returns the file path of the generated GLB.`,
+    `Generate a textured 3D model (GLB) from a reference image (~1 min). Returns the file path of the generated GLB.
+
+NOTE: This produces a single mesh, NOT a sim-ready asset. If the user asked for "sim-ready" / "physics-ready" / "articulated" / "Isaac Sim" / "USDZ for simulation", you must continue: scale_model → ground_model → segment_model → inspect_model → merge_parts → apply_part_names → export_articulation.`,
     {
       image_path: z.string().describe('Absolute file path to the reference image (PNG/JPG). Can be a path from generate_image output or any local image file.'),
       seed: z.number().int().optional().describe('Random seed for reproducibility. Omit for random results.'),
@@ -257,7 +279,9 @@ The URL must be reachable from the MCP server. Common sources: presigned cloud-s
 
   server.tool(
     'segment_model',
-    'Segment a 3D model (GLB) into individual parts. Splits a single mesh into meaningful parts (e.g. head, body, legs, arms). Takes 1-3 minutes. Returns the file path of the segmented GLB and the number of parts.',
+    `Segment a 3D model (GLB) into individual parts. Splits a single mesh into meaningful parts (e.g. head, body, legs, arms). Takes 1-3 minutes. Returns the file path of the segmented GLB and the number of parts.
+
+NOTE: Segmentation alone is NOT sim-ready. If the user asked for "sim-ready" / "physics-ready" / "articulated" / "Isaac Sim" / "USDZ for simulation", this is a middle step — you still need: inspect_model → merge_parts → apply_part_names → export_articulation. Do not stop after segment_model when the goal is simulation.`,
     {
       glb_path: z.string().describe('Absolute path to a GLB file to segment.'),
       point_num: z.number().int().min(1000).max(20000).optional().describe('Number of sample points (must be >= 1000; default: backend default).'),
@@ -652,7 +676,7 @@ Returns the translation applied (dx, dy, dz), original bbox, final bbox, and the
 
   server.tool(
     'export_articulation',
-    `Export a physics-ready articulation (USDA or USDZ) from a GLB plus a description of its rigid bodies and joints. This replaces what a human user would do in the Phidias Physics tab: assign materials, set mass / collision / friction per part, lay out the joint topology, and click "export".
+    `Export a physics-ready / sim-ready articulation (USDA or USDZ) from a GLB plus a description of its rigid bodies and joints. THIS IS THE SIM-READY ENDPOINT — when the user asked for a "sim-ready" / "physics-ready" / "articulated" / "Isaac Sim" / "Omniverse" asset, the pipeline must finish here, not at segment_model. This replaces what a human user would do in the Phidias Physics tab: assign materials, set mass / collision / friction per part, lay out the joint topology, and click "export".
 
 Typical pipeline:
   segment_model → inspect_model → (optional merge_parts) → apply_part_names
