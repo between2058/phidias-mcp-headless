@@ -76,7 +76,9 @@ A segmented GLB by itself is NOT sim-ready. If the user asked for "sim-ready" an
 
   server.tool(
     'generate_image',
-    'Generate a reference image from a text prompt. Returns the file path of the generated image. Use this as the first step to create a 3D model — generate a concept image, then pass it to generate_3d.',
+    `Generate a reference image from a text prompt. Returns the file path of the generated image. Use this as the first step to create a 3D model — generate a concept image, then pass it to generate_3d.
+
+PREFLIGHT — check seed assets first. If the user named a specific real-world subject (e.g. "gb300", "Aeron chair", "RTX 4090"), call list_generated_assets BEFORE generating and look for an entry whose Asset ID starts with "seed_" and whose stem matches the subject (e.g. "gb300" → seed_gb300, seed_GB300, seed_gb_300). Match case-insensitively and treat hyphens/underscores/spaces as equivalent. If a match exists, SKIP generate_image entirely and pass that seed asset's File path directly to generate_3d — seed images are pre-curated references and must be preferred over freshly generated ones.`,
     {
       prompt: z.string().describe('Text description of the image to generate (English recommended). Be specific about the subject, style, and viewing angle. For 3D model creation, include "front view" or "3/4 view" for best results.'),
       negative_prompt: z.string().optional().describe('Things to exclude from the image (e.g. "blurry, low quality, distorted")'),
@@ -228,6 +230,8 @@ The URL must be reachable from the MCP server. Common sources: presigned cloud-s
   server.tool(
     'generate_3d',
     `Generate a textured 3D model (GLB) from a reference image (~1 min). Returns the file path of the generated GLB.
+
+PREFLIGHT — check seed assets first. If the user named a specific real-world subject (e.g. "make a gb300 3D model"), call list_generated_assets BEFORE you have an image path and look for an entry whose Asset ID starts with "seed_" and whose stem matches the subject. Match case-insensitively and treat hyphens/underscores/spaces as equivalent (e.g. "gb300" matches seed_gb300, seed_GB300, seed_gb_300). If a seed image matches, pass its File path here directly — do NOT call generate_image first. Only fall through to generate_image when no seed matches and the user did not provide a path.
 
 NOTE: This produces a single mesh, NOT a sim-ready asset. If the user asked for "sim-ready" / "physics-ready" / "articulated" / "Isaac Sim" / "USDZ for simulation", you must continue: scale_model → ground_model → segment_model → inspect_model → merge_parts → apply_part_names → export_articulation.`,
     {
@@ -854,7 +858,9 @@ Returns the local path and URL of the produced USD file plus an asset_id usable 
 
   server.tool(
     'list_generated_assets',
-    'List all images and 3D models generated in the current session. Shows file paths, types, prompts, and creation times.',
+    `List all images and 3D models available in the current session — both generated assets AND pre-staged seed assets loaded from PHIDIAS_SEED_DIR. Shows file paths, types, prompts, and creation times. Seed entries have an Asset ID prefixed with "seed_" (the stem comes from the original filename, e.g. gb300.jpg → seed_gb300).
+
+USE AS A PREFLIGHT before generate_image / generate_3d whenever the user names a specific real-world subject. Scan for a "seed_<subject>" Asset ID (case-insensitive, hyphens/underscores/spaces treated as equivalent); if found, pass that entry's File path straight to generate_3d and skip generate_image.`,
     {},
     async () => {
       const assets = getSessionAssets();
