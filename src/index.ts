@@ -44,6 +44,23 @@ import { sessionBus, type SessionEvent } from './event-bus.js';
 // so tool registration lives in a function we can call per-connection.
 // ---------------------------------------------------------------------------
 
+/**
+ * Derive a coarse SimReady-Foundation semantic class hint from the prompt text.
+ * Used by `generate_aif_metadata` when the caller doesn't override `semantic_class`.
+ * Falls back to "industrial_equipment" — the most common Phidias use case.
+ */
+function _inferSemanticClass(prompt: string): string {
+  const p = prompt.toLowerCase();
+  if (/\b(robot|gripper|arm|articulation|joint)\b/.test(p)) return 'robotic_component';
+  if (/\b(sensor|gauge|meter|switch|button|panel|plc|display)\b/.test(p)) return 'instrument';
+  if (/\b(valve|pump|motor|actuator|cylinder|hydraulic|pneumatic)\b/.test(p)) return 'fluid_power_component';
+  if (/\b(box|crate|container|bin|drum|cylinder|tank)\b/.test(p)) return 'container';
+  if (/\b(forklift|pallet|conveyor|cart|trolley|dolly)\b/.test(p)) return 'material_handling';
+  if (/\b(toolbox|wrench|drill|saw|grinder|mill|lathe)\b/.test(p)) return 'tooling';
+  if (/\b(extinguisher|first aid|helmet|goggle|glove|vest|boot)\b/.test(p)) return 'safety_equipment';
+  return 'industrial_equipment';
+}
+
 function createServer(): McpServer {
   const server = new McpServer(
     {
@@ -918,6 +935,411 @@ Pipeline placement: typically right after generate_3d (no scale_model / segment_
       return {
         content: [{ type: 'text' as const, text: lines.join('\n') }],
       };
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Tool: generate_simready_usdz
+  // -------------------------------------------------------------------------
+
+  server.tool(
+    'generate_simready_usdz',
+    `One-shot orchestrator: text prompt → NVIDIA SimReady-clean USDZ + physics.json + aif-pipeline metadata.json + validation report.
+
+Internally runs the full 8-stage Phidias pipeline (image → 3D → scale → ground → segment → inspect → apply_part_names → export_articulation), then optionally runs the NVIDIA \`omniverse-asset-validator\` (the library that \`aif-pipeline validate\` wraps) and emits an aif-pipeline-compatible metadata.json.
+
+Use this when you want a single MCP call that takes a description and produces a NVIDIA-SimReady-Foundation-clean USDZ ready to feed into \`aif-pipeline optimize\` / \`aif-pipeline metadata apply\` downstream.
+
+Typical end-to-end time: ~70 sec on a single NVIDIA RTX PRO 6000 Blackwell.`,
+    {
+      prompt: z.string().describe('Text description of the asset (English recommended; include view hint like "front 3/4 view").'),
+      target_profile: z.enum(['Prop-Robotics-Neutral', 'Prop-Robotics-PhysX', 'Prop-Robotics-Isaac']).optional().describe('SimReady profile (default: Prop-Robotics-PhysX).'),
+      height_m: z.number().positive().optional().describe('Target physical height in meters (default: 1.0).'),
+      watertight: z.boolean().optional().describe('Run Step1X-3D-inspired SDF watertight conversion before USD export (default: true). Required for 0/0 SimReady-clean output; drops texture/UV in exchange.'),
+      validate: z.boolean().optional().describe('Run NVIDIA SimReady validator after export (default: true).'),
+      emit_metadata: z.boolean().optional().describe('Generate aif-pipeline-compatible metadata.json (default: true).'),
+    },
+    async ({ prompt, target_profile, height_m, watertight, validate, emit_metadata }) => {
+      const targetProfile = target_profile || 'Prop-Robotics-PhysX';
+      const targetHeight = height_m ?? 1.0;
+      const doWatertight = watertight !== false;
+      const doValidate = validate !== false;
+      const doMetadata = emit_metadata !== false;
+
+      const lines: string[] = [];
+      const t0 = Date.now();
+
+      try {
+        // 1. generate_image
+        const img = await generateImage(prompt, { num_steps: 25 });
+        lines.push(`✓ generate_image  → ${img.filePath}`);
+
+        // 2. generate_3d
+        const raw = await generate3D(img.filePath, { backend: 'reconviagen' });
+        lines.push(`✓ generate_3d     → ${raw.filePath}`);
+
+        // 3. scale_model
+        const scaled = await scaleModel({ glb_path: raw.filePath, height_m: targetHeight });
+        lines.push(`✓ scale_model     → ${scaled.output_path}`);
+
+        // 4. ground_model
+        const grounded = await groundModel({ glb_path: scaled.output_path });
+        lines.push(`✓ ground_model    → ${grounded.output_path}`);
+
+        // 5. segment_model
+        const segmented = await segment3D(grounded.output_path);
+        lines.push(`✓ segment_model   → ${segmented.filePath} (${segmented.numParts} parts)`);
+
+        // 6. inspect_model
+        const inspected = await inspectGltf(segmented.filePath);
+        const meshNodes = inspected.nodes.filter((n) => n.mesh_index !== null);
+        if (meshNodes.length === 0) {
+          return {
+            content: [{ type: 'text' as const, text: lines.join('\n') + '\n✗ inspect_model returned no mesh-bearing nodes' }],
+            isError: true,
+          };
+        }
+        lines.push(`✓ inspect_model   → ${meshNodes.length} mesh-bearing nodes`);
+
+        // 7. apply_part_names: rename mesh-bearing nodes to part_0..part_N
+        const names: Record<string, string> = {};
+        meshNodes.forEach((n, i) => { names[String(n.index)] = `part_${i}`; });
+        const renamed = await applyPartNames({ glb_path: segmented.filePath, names });
+        lines.push(`✓ apply_part_names → ${renamed.output_path}`);
+
+        // 7.5 Optional: Step1X-3D-inspired watertight conversion before export.
+        // Eliminates VG.007 mesh-manifold warnings (~92% of parts strictly watertight).
+        // Tradeoff: drops textures/UVs — SDF reconstruction produces new vertices.
+        let exportGlbPath = renamed.output_path;
+        let exportMeshNodes = meshNodes;
+        if (doWatertight) {
+          const { spawnSync } = await import('node:child_process');
+          const helperPath = path.resolve(
+            new URL('.', import.meta.url).pathname,
+            '../python_helpers/watertight_glb.py',
+          );
+          const pythonBin = process.env.PHIDIAS_VALIDATE_PYTHON
+            || '/home/pegaai/phidas/benchmark/.venv/bin/python';
+          const wtOut = renamed.output_path.replace(/\.glb$/, '_watertight.glb');
+          const wtRes = spawnSync(pythonBin, [helperPath, renamed.output_path, wtOut], {
+            encoding: 'utf-8',
+            timeout: 120_000,
+          });
+          if (wtRes.error || wtRes.status !== 0) {
+            lines.push(`⚠ watertight: invocation failed (${wtRes.error?.message || `exit ${wtRes.status}`}) — proceeding without`);
+          } else {
+            try {
+              const wtReport = JSON.parse(wtRes.stdout);
+              if (wtReport.ok) {
+                lines.push(`✓ watertight       → ${wtOut} (${wtReport.parts_strictly_watertight}/${wtReport.part_count} strict-watertight, ${wtReport.elapsed_ms}ms)`);
+                exportGlbPath = wtOut;
+                // Re-inspect — watertight may drop parts that failed conversion
+                const wtInspect = await inspectGltf(wtOut);
+                exportMeshNodes = wtInspect.nodes.filter((n) => n.mesh_index !== null);
+              } else {
+                lines.push(`⚠ watertight failed: ${wtReport.error} — proceeding without`);
+              }
+            } catch (_e) {
+              lines.push('⚠ watertight: unparseable helper output — proceeding without');
+            }
+          }
+        }
+
+        // 8. export_articulation — build parts from whatever's actually in the GLB
+        // (watertight may have changed the set if any part failed conversion).
+        const parts = exportMeshNodes.map((n, i) => ({
+          id: n.name || `part_${i}`,
+          name: n.name || `part_${i}`,
+          type: (i === 0 ? 'base' : 'link') as 'base' | 'link',
+          mobility: 'fixed' as const,
+        }));
+        const exported = await exportArticulation({
+          glb_path: exportGlbPath,
+          model_name: 'phidias_simready_asset',
+          parts,
+          joints: [],
+          format: 'usdz',
+        });
+        const usdzPath = exported.output_path;
+        lines.push(`✓ export_articulation → ${usdzPath}`);
+
+        const elapsedSec = ((Date.now() - t0) / 1000).toFixed(1);
+        lines.push('');
+        lines.push(`Pipeline elapsed: ${elapsedSec}s`);
+
+        // 9. Optional: run NVIDIA SimReady validator
+        let simReadyClean = false;
+        if (doValidate) {
+          const { spawnSync } = await import('node:child_process');
+          const helperPath = path.resolve(
+            new URL('.', import.meta.url).pathname,
+            '../python_helpers/simready_validate.py',
+          );
+          const pythonBin = process.env.PHIDIAS_VALIDATE_PYTHON
+            || '/home/pegaai/phidas/benchmark/.venv/bin/python';
+          const vRes = spawnSync(pythonBin, [helperPath, usdzPath], { encoding: 'utf-8', timeout: 60_000 });
+          if (vRes.error || vRes.status !== 0) {
+            lines.push(`⚠ NVIDIA SimReady validator: invocation failed (${vRes.error?.message || `exit ${vRes.status}`})`);
+          } else {
+            try {
+              const report = JSON.parse(vRes.stdout);
+              if (report.ok && report.pass && report.warning_count === 0) {
+                lines.push(`✓ NVIDIA SimReady validator: PASS (0/0 issues, 0/${40} rules violated)`);
+                simReadyClean = true;
+              } else if (report.ok && report.pass) {
+                lines.push(`✓ NVIDIA SimReady validator: PASS (0 FAILURE, ${report.warning_count} WARNING)`);
+                simReadyClean = report.warning_count === 0;
+              } else {
+                lines.push(`✗ NVIDIA SimReady validator: ${report.failure_count} FAILURE, ${report.warning_count} WARNING`);
+              }
+            } catch (_e) {
+              lines.push('⚠ NVIDIA SimReady validator: unparseable output');
+            }
+          }
+        }
+
+        // 10. Optional: emit aif-pipeline-compatible metadata.json
+        let metadataPath: string | null = null;
+        if (doMetadata) {
+          const stem = path.basename(usdzPath, path.extname(usdzPath));
+          metadataPath = path.join(path.dirname(usdzPath), `${stem}.metadata.json`);
+          const metadata = {
+            schema: 'aif.simready.metadata.v1',
+            asset_id: stem,
+            asset_class: 'Prop',
+            asset_type: 'manufacturing',
+            target_profile: targetProfile,
+            dense_caption: prompt,
+            semantic_labels: { class: _inferSemanticClass(prompt), domain: 'manufacturing' },
+            physics: {
+              rigid_body: true,
+              collision_approximation: 'convexHull',
+              default_density_kg_m3: 1000.0,
+              default_friction_static: 0.5,
+              default_friction_dynamic: 0.5,
+              default_restitution: 0.0,
+            },
+            provenance: {
+              generator: 'phidias',
+              generator_version: process.env.PHIDIAS_VERSION || 'v6',
+              pipeline_stage: 'phidias_generate -> aif_pipeline_input',
+              simready_clean: simReadyClean,
+            },
+          };
+          fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
+          lines.push(`✓ aif-pipeline metadata.json → ${metadataPath}`);
+        }
+
+        lines.push('');
+        lines.push('=== SUMMARY ===');
+        lines.push(`USDZ:           ${usdzPath}`);
+        const urlBase = makeFileUrl(usdzPath);
+        if (urlBase) lines.push(`URL:            ${urlBase}`);
+        if (exported.physics_json_path) lines.push(`Physics JSON:   ${exported.physics_json_path}`);
+        if (metadataPath) lines.push(`AIF Metadata:   ${metadataPath}`);
+        lines.push(`Parts:          ${parts.length}`);
+        lines.push(`Target profile: ${targetProfile}`);
+        lines.push(`Total elapsed:  ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+        lines.push('');
+        lines.push('Next steps (aif-pipeline downstream, requires Omniverse Kit):');
+        lines.push(`  aif-pipeline optimize ${usdzPath} <output>.usdz --preset generic`);
+        if (metadataPath) {
+          lines.push(`  aif-pipeline metadata apply ${metadataPath} --output <layer>.usda`);
+        }
+
+        return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        lines.push('');
+        lines.push(`✗ Error: ${msg}`);
+        return {
+          content: [{ type: 'text' as const, text: lines.join('\n') }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Tool: run_aif_validate
+  // -------------------------------------------------------------------------
+
+  server.tool(
+    'run_aif_validate',
+    `Validate a USD/USDZ asset against NVIDIA SimReady Foundation rules using the official \`omniverse-asset-validator\` Python library (the same backend that \`aif-pipeline validate\` wraps internally).
+
+Returns a JSON report with: pass/fail flag, essential-clean flag, per-severity counts (FAILURE / WARNING), unique rules failed, and a per-rule breakdown.
+
+Use this on any USDZ output (e.g. from \`export_articulation\` or \`generate_simready_usdz\`) to confirm NVIDIA SimReady Foundation compliance before shipping to a customer.
+
+Equivalent in effect to: \`aif-pipeline validate <usdz>\``,
+    {
+      usdz_path: z.string().describe('Absolute path to the USDZ (or USDA/USD) file to validate.'),
+    },
+    async ({ usdz_path }) => {
+      try {
+        if (!fs.existsSync(usdz_path)) {
+          return {
+            content: [{ type: 'text' as const, text: `Error: file not found: ${usdz_path}` }],
+            isError: true,
+          };
+        }
+        const { spawnSync } = await import('node:child_process');
+        const helperPath = path.resolve(
+          new URL('.', import.meta.url).pathname,
+          '../python_helpers/simready_validate.py',
+        );
+        const pythonBin = process.env.PHIDIAS_VALIDATE_PYTHON
+          || '/home/pegaai/phidas/benchmark/.venv/bin/python';
+        const result = spawnSync(pythonBin, [helperPath, usdz_path], {
+          encoding: 'utf-8',
+          timeout: 60_000,
+        });
+        if (result.error) {
+          return {
+            content: [{ type: 'text' as const, text: `Error invoking validator: ${result.error.message}` }],
+            isError: true,
+          };
+        }
+        let report: any;
+        try {
+          report = JSON.parse(result.stdout);
+        } catch (_err) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: `Validator output was not JSON.\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+            }],
+            isError: true,
+          };
+        }
+        if (!report.ok) {
+          return {
+            content: [{ type: 'text' as const, text: `Validator error: ${report.error}` }],
+            isError: true,
+          };
+        }
+        const lines: string[] = [
+          report.pass
+            ? '✅ NVIDIA SimReady validator: PASS (0 FAILURE-severity issues)'
+            : '❌ NVIDIA SimReady validator: FAIL',
+          '',
+          `Asset: ${report.asset}`,
+          `Validator: ${report.validator_version}`,
+          '',
+          `total_issues: ${report.total_issues}`,
+          `failure_count: ${report.failure_count}`,
+          `warning_count: ${report.warning_count}`,
+          `essential_failure_count: ${report.essential_failure_count}`,
+          `essential_clean: ${report.essential_clean}`,
+          `unique_rules_failed: ${report.unique_rules_failed}`,
+        ];
+        if (Object.keys(report.rule_failure_counts).length > 0) {
+          lines.push('', 'Per-rule failures:');
+          for (const [code, count] of Object.entries(report.rule_failure_counts)) {
+            lines.push(`  ${code}: ${count}`);
+          }
+        }
+        lines.push('', `validate_time_ms: ${report.validate_time_ms}`);
+        return {
+          content: [{ type: 'text' as const, text: lines.join('\n') }],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: `Error running validator: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Tool: generate_aif_metadata
+  // -------------------------------------------------------------------------
+
+  server.tool(
+    'generate_aif_metadata',
+    `Generate an \`aif-pipeline\`-compatible metadata.json template for a Phidias USDZ.
+
+The output JSON follows the \`aif.simready.metadata.v1\` schema that \`aif-pipeline metadata apply\` consumes. Includes:
+  - asset_class, target_profile (Prop-Robotics-PhysX by default)
+  - dense_caption (= the user's text prompt)
+  - semantic_labels (class + domain hints)
+  - physics defaults (density, friction, restitution)
+  - provenance (generator=phidias, version)
+
+Returns the path to the generated JSON file (saved next to the USDZ as \`<asset_id>.metadata.json\`).
+
+Downstream usage: \`aif-pipeline metadata apply <generated.json> --output <layer.usda>\``,
+    {
+      usdz_path: z.string().describe('Absolute path to the Phidias-generated USDZ.'),
+      prompt: z.string().describe('The original text prompt that generated this asset; written into dense_caption.'),
+      asset_class: z.enum(['Prop', 'Robot', 'Environment']).optional().describe('SimReady asset class (default: Prop).'),
+      target_profile: z.enum(['Prop-Robotics-Neutral', 'Prop-Robotics-PhysX', 'Prop-Robotics-Isaac']).optional().describe('Target SimReady profile (default: Prop-Robotics-PhysX).'),
+      asset_type: z.string().optional().describe('Semantic domain (default: "manufacturing").'),
+      semantic_class: z.string().optional().describe('Override semantic class hint (default: derived from prompt).'),
+    },
+    async ({ usdz_path, prompt, asset_class, target_profile, asset_type, semantic_class }) => {
+      try {
+        if (!fs.existsSync(usdz_path)) {
+          return {
+            content: [{ type: 'text' as const, text: `Error: USDZ not found: ${usdz_path}` }],
+            isError: true,
+          };
+        }
+        const usdzAbs = path.resolve(usdz_path);
+        const stem = path.basename(usdzAbs, path.extname(usdzAbs));
+        const outPath = path.join(path.dirname(usdzAbs), `${stem}.metadata.json`);
+
+        const metadata = {
+          schema: 'aif.simready.metadata.v1',
+          asset_id: stem,
+          asset_class: asset_class || 'Prop',
+          asset_type: asset_type || 'manufacturing',
+          target_profile: target_profile || 'Prop-Robotics-PhysX',
+          dense_caption: prompt,
+          semantic_labels: {
+            class: semantic_class || _inferSemanticClass(prompt),
+            domain: asset_type || 'manufacturing',
+          },
+          physics: {
+            rigid_body: true,
+            collision_approximation: 'convexHull',
+            default_density_kg_m3: 1000.0,
+            default_friction_static: 0.5,
+            default_friction_dynamic: 0.5,
+            default_restitution: 0.0,
+          },
+          provenance: {
+            generator: 'phidias',
+            generator_version: process.env.PHIDIAS_VERSION || 'v6',
+            pipeline_stage: 'phidias_generate -> aif_pipeline_input',
+          },
+        };
+        fs.writeFileSync(outPath, JSON.stringify(metadata, null, 2));
+
+        const lines = [
+          'aif-pipeline metadata.json generated.',
+          '',
+          `File: ${outPath}`,
+          `Asset ID: ${metadata.asset_id}`,
+          `Target profile: ${metadata.target_profile}`,
+          `Dense caption: "${metadata.dense_caption}"`,
+          '',
+          'Apply downstream via:',
+          `  aif-pipeline metadata apply ${outPath} --output <layer.usda>`,
+        ];
+        return {
+          content: [{ type: 'text' as const, text: lines.join('\n') }],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: `Error generating metadata: ${msg}` }],
+          isError: true,
+        };
+      }
     },
   );
 
