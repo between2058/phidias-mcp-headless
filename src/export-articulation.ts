@@ -112,6 +112,12 @@ export interface ExportArticulationParams {
   joints: ExportJoint[];
   format: 'usda' | 'usdz';
   emit_physics_json?: boolean;
+  // Output convention. 'isaac' (default) → Z-up + UsdPhysics for Isaac Sim /
+  // Omniverse. 'arkit' → Y-up, no UsdPhysics, for iOS AR Quick Look. The
+  // backend uses this to pick the stage upAxis and decide whether to rotate
+  // mesh vertices from glTF Y-up; the auto-orient pre-flight and the physics
+  // JSON emitter are no-ops in arkit mode (a single fixed part, no joints).
+  target_platform?: 'isaac' | 'arkit';
 }
 
 export interface ExportArticulationResult {
@@ -429,10 +435,17 @@ export async function exportArticulation(
   // Pre-flight: every part.id must resolve to a GLB node with a real mesh.
   // An empty group node (leftover from apply_part_names groups:) would
   // vanish in the physics JSON and produce a broken articulation.
-  const meshCheck = validatePartsHaveMesh(
-    geometries,
-    params.parts.map((p) => p.id),
-  );
+  //
+  // Skipped for target_platform === 'arkit': in arkit mode the parts array
+  // is a synthetic single-fixed-body wrapper added just to satisfy the
+  // backend schema. The backend doesn't inject UsdPhysics, so part_id ↔ node
+  // name mismatch is harmless.
+  const meshCheck = params.target_platform === 'arkit'
+    ? { missing: [] as string[], noMesh: [] as string[] }
+    : validatePartsHaveMesh(
+        geometries,
+        params.parts.map((p) => p.id),
+      );
   if (meshCheck.missing.length > 0 || meshCheck.noMesh.length > 0) {
     const msgs: string[] = [];
     if (meshCheck.missing.length > 0) {
@@ -503,6 +516,7 @@ export async function exportArticulation(
     model_name: params.model_name,
     parts: expandedParts,
     joints: backendJoints,
+    target_platform: params.target_platform ?? 'isaac',
   };
 
   // Upload GLB + articulation JSON as multipart/form-data.

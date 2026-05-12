@@ -3,7 +3,7 @@
  * Phidias MCP Server (Headless)
  *
  * Exposes the Phidias 3D asset pipeline as MCP tools for Claude Code.
- * Tools: generate_image, upload_image, upload_from_url, generate_3d, segment_model, list_generated_assets
+ * Tools: generate_image, upload_image, upload_from_url, generate_3d, segment_model, export_articulation, export_for_arkit, list_generated_assets
  *
  * Headless variant — no browser frontend, no WebSocket bridge.
  * All tools are pure backend operations that return file paths on disk.
@@ -11,6 +11,7 @@
 
 import http from 'node:http';
 import fs from 'node:fs';
+import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -803,6 +804,74 @@ Returns the local path and URL of the produced USD file plus an asset_id usable 
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: 'text' as const, text: `Error exporting articulation: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Tool: export_for_arkit
+  // -------------------------------------------------------------------------
+
+  server.tool(
+    'export_for_arkit',
+    `Convert a GLB into a USDZ tailored for iOS AR Quick Look — Y-up stage, no UsdPhysics schemas, textures embedded. Use this when the consumer is an iPhone / iPad (e.g. forwarding the file via Telegram, AirDrop, iMessage; embedding in a webpage's <model-viewer ar> tag).
+
+This is NOT the sim-ready endpoint. For Isaac Sim / Omniverse use export_articulation, which produces Z-up USDZ with full PhysicsRigidBody / PhysicsRevoluteJoint prims. AR Quick Look ignores physics anyway, and Y-up is the orientation iOS expects.
+
+The exporter wraps the GLB as a single fixed rigid body internally (the articulation-service requires at least one part). The resulting USDZ has no joints, no PhysicsScene, no MassAPI — just textured geometry under a Y-up stage. File size ends up noticeably smaller than the equivalent Isaac USDZ for the same GLB.
+
+Pipeline placement: typically right after generate_3d (no scale_model / segment_model / etc. needed unless you want a specific physical size in AR — ARKit honours the USD metersPerUnit, so running scale_model before this makes the model land at correct real-world scale when placed in AR).`,
+    {
+      glb_path: z.string().describe('Absolute path to the GLB to convert. Usually the output of generate_3d or scale_model.'),
+      model_name: z.string().min(1).optional().describe('Name embedded in the USD root prim. Defaults to the GLB filename stem. Cosmetic only — does not affect AR Quick Look display.'),
+    },
+    async (params) => {
+      try {
+        const stem = path.basename(params.glb_path).replace(/\.[^.]+$/, '');
+        const modelName = (params.model_name ?? stem).replace(/[^A-Za-z0-9_]/g, '_') || 'model';
+        const result = await exportArticulation({
+          glb_path: params.glb_path,
+          model_name: modelName,
+          parts: [
+            {
+              id: modelName,
+              name: modelName,
+              type: 'base',
+              mobility: 'fixed',
+              collision_type: 'none',
+            },
+          ],
+          joints: [],
+          format: 'usdz',
+          target_platform: 'arkit',
+          emit_physics_json: false,
+        });
+
+        const lines: string[] = [
+          'ARKit USDZ exported successfully.',
+          '',
+          `File: ${result.output_path}`,
+        ];
+        const url = makeFileUrl(result.output_path);
+        if (url) lines.push(`URL: ${url}`);
+        lines.push(`Asset ID: ${result.asset_id}`);
+        lines.push(`Backend filename: ${result.backend_filename}`);
+        lines.push(`Source GLB: ${result.source}`);
+        lines.push('', 'Drop this file into iMessage / Telegram / AirDrop on iOS — tapping it opens AR Quick Look.');
+        if (result.warnings.length > 0) {
+          lines.push('', 'Warnings:');
+          for (const w of result.warnings) lines.push(`  - ${w}`);
+        }
+
+        return {
+          content: [{ type: 'text' as const, text: lines.join('\n') }],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: `Error exporting for ARKit: ${msg}` }],
           isError: true,
         };
       }
