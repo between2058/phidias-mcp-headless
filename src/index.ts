@@ -1098,36 +1098,41 @@ Typical end-to-end time: ~70 sec on a single NVIDIA RTX PRO 6000 Blackwell.`,
           }
         }
 
-        // 10. Optional: emit aif-pipeline-compatible metadata.json
+        // 10. Optional: emit NVIDIA SimReady_Metadata companion JSON.
+        // Schema mirrors nvidia/simready-foundation/sample_content/*/sm_*.json
+        // — the format NVIDIA themselves ship alongside SimReady USD assets.
         let metadataPath: string | null = null;
         if (doMetadata) {
+          const usdzDir = path.dirname(usdzPath);
           const stem = path.basename(usdzPath, path.extname(usdzPath));
-          metadataPath = path.join(path.dirname(usdzPath), `${stem}.metadata.json`);
-          const metadata = {
-            schema: 'aif.simready.metadata.v1',
-            asset_id: stem,
-            asset_class: 'Prop',
-            asset_type: 'manufacturing',
-            target_profile: targetProfile,
-            dense_caption: prompt,
-            semantic_labels: { class: _inferSemanticClass(prompt), domain: 'manufacturing' },
-            physics: {
-              rigid_body: true,
-              collision_approximation: 'convexHull',
-              default_density_kg_m3: 1000.0,
-              default_friction_static: 0.5,
-              default_friction_dynamic: 0.5,
-              default_restitution: 0.0,
+          metadataPath = path.join(usdzDir, `${stem}.json`);
+          const profileVersion = targetProfile === 'Prop-Robotics-Neutral' ? '1.0.0' : '0.2.0';
+          const isoNow = new Date().toISOString().replace('T', ' ').slice(0, 19);
+          const metadata: any = {
+            SimReady_Metadata: {
+              asset_type: 'prop',
+              validation: {
+                profile: targetProfile,
+                profile_version: profileVersion,
+              },
             },
-            provenance: {
+            asset_dir: usdzDir,
+            asset_name: stem,
+            asset_type: 'prop',
+            profile: targetProfile,
+            source_file: `@${prompt}@`,
+            usd_date_generated: isoNow,
+            used_dsrs_exporter: false,
+            phidias_provenance: {
               generator: 'phidias',
               generator_version: process.env.PHIDIAS_VERSION || 'v6',
-              pipeline_stage: 'phidias_generate -> aif_pipeline_input',
+              prompt: prompt,
+              semantic_class_hint: _inferSemanticClass(prompt),
               simready_clean: simReadyClean,
             },
           };
-          fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
-          lines.push(`✓ aif-pipeline metadata.json → ${metadataPath}`);
+          fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 4));
+          lines.push(`✓ SimReady companion JSON → ${metadataPath}`);
         }
 
         lines.push('');
@@ -1136,7 +1141,7 @@ Typical end-to-end time: ~70 sec on a single NVIDIA RTX PRO 6000 Blackwell.`,
         const urlBase = makeFileUrl(usdzPath);
         if (urlBase) lines.push(`URL:            ${urlBase}`);
         if (exported.physics_json_path) lines.push(`Physics JSON:   ${exported.physics_json_path}`);
-        if (metadataPath) lines.push(`AIF Metadata:   ${metadataPath}`);
+        if (metadataPath) lines.push(`SimReady JSON:  ${metadataPath}`);
         lines.push(`Parts:          ${parts.length}`);
         lines.push(`Target profile: ${targetProfile}`);
         lines.push(`Total elapsed:  ${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -1260,27 +1265,32 @@ Equivalent in effect to: \`aif-pipeline validate <usdz>\``,
 
   server.tool(
     'generate_aif_metadata',
-    `Generate an \`aif-pipeline\`-compatible metadata.json template for a Phidias USDZ.
+    `Generate a SimReady-Foundation companion JSON for a Phidias USDZ.
 
-The output JSON follows the \`aif.simready.metadata.v1\` schema that \`aif-pipeline metadata apply\` consumes. Includes:
-  - asset_class, target_profile (Prop-Robotics-PhysX by default)
-  - dense_caption (= the user's text prompt)
-  - semantic_labels (class + domain hints)
-  - physics defaults (density, friction, restitution)
-  - provenance (generator=phidias, version)
+The output JSON follows the NVIDIA-shipped \`SimReady_Metadata\` schema observed in \`nvidia/simready-foundation/sample_content/*\` (e.g. \`sm_obs_joystick_a01_01.json\`). It is the companion file that lives alongside a SimReady USD asset and declares its validation profile, asset_type, and provenance.
 
-Returns the path to the generated JSON file (saved next to the USDZ as \`<asset_id>.metadata.json\`).
+Fields written:
+  - SimReady_Metadata.asset_type            ("prop" by default)
+  - SimReady_Metadata.validation.profile    (Prop-Robotics-PhysX / Neutral / Isaac)
+  - SimReady_Metadata.validation.profile_version
+  - asset_dir, asset_name                   (filesystem + display)
+  - asset_type, profile                     (duplicated top-level — matches NVIDIA samples)
+  - source_file                             (link to the originating prompt / image)
+  - usd_date_generated                      (UTC ISO timestamp)
+  - used_dsrs_exporter                      (false — Phidias is an AI generator, not DSRS)
+  - phidias_provenance                      (optional sub-block: prompt, generator_version)
 
-Downstream usage: \`aif-pipeline metadata apply <generated.json> --output <layer.usda>\``,
+Saved next to the USDZ as \`<asset_stem>.json\`.
+
+The exact schema is what NVIDIA SimReady Foundation samples publish; \`aif-pipeline metadata apply\` compatibility is pending Omniverse Kit verification.`,
     {
       usdz_path: z.string().describe('Absolute path to the Phidias-generated USDZ.'),
-      prompt: z.string().describe('The original text prompt that generated this asset; written into dense_caption.'),
-      asset_class: z.enum(['Prop', 'Robot', 'Environment']).optional().describe('SimReady asset class (default: Prop).'),
-      target_profile: z.enum(['Prop-Robotics-Neutral', 'Prop-Robotics-PhysX', 'Prop-Robotics-Isaac']).optional().describe('Target SimReady profile (default: Prop-Robotics-PhysX).'),
-      asset_type: z.string().optional().describe('Semantic domain (default: "manufacturing").'),
-      semantic_class: z.string().optional().describe('Override semantic class hint (default: derived from prompt).'),
+      prompt: z.string().describe('The original text prompt that generated this asset; recorded in phidias_provenance.'),
+      target_profile: z.enum(['Prop-Robotics-Neutral', 'Prop-Robotics-PhysX', 'Prop-Robotics-Isaac']).optional().describe('SimReady profile (default: Prop-Robotics-PhysX).'),
+      asset_type: z.enum(['prop', 'robot']).optional().describe('NVIDIA SimReady asset_type (default: "prop").'),
+      profile_version: z.string().optional().describe('Profile version (default: "0.2.0" for PhysX, "1.0.0" for Neutral).'),
     },
-    async ({ usdz_path, prompt, asset_class, target_profile, asset_type, semantic_class }) => {
+    async ({ usdz_path, prompt, target_profile, asset_type, profile_version }) => {
       try {
         if (!fs.existsSync(usdz_path)) {
           return {
@@ -1289,46 +1299,54 @@ Downstream usage: \`aif-pipeline metadata apply <generated.json> --output <layer
           };
         }
         const usdzAbs = path.resolve(usdz_path);
+        const usdzDir = path.dirname(usdzAbs);
         const stem = path.basename(usdzAbs, path.extname(usdzAbs));
-        const outPath = path.join(path.dirname(usdzAbs), `${stem}.metadata.json`);
+        const outPath = path.join(usdzDir, `${stem}.json`);
 
-        const metadata = {
-          schema: 'aif.simready.metadata.v1',
-          asset_id: stem,
-          asset_class: asset_class || 'Prop',
-          asset_type: asset_type || 'manufacturing',
-          target_profile: target_profile || 'Prop-Robotics-PhysX',
-          dense_caption: prompt,
-          semantic_labels: {
-            class: semantic_class || _inferSemanticClass(prompt),
-            domain: asset_type || 'manufacturing',
+        const profile = target_profile || 'Prop-Robotics-PhysX';
+        const ver = profile_version || (profile === 'Prop-Robotics-Neutral' ? '1.0.0' : '0.2.0');
+        const assetTypeStr = asset_type || 'prop';
+        const isoNow = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+        // NVIDIA SimReady_Metadata format — the shape shipped in
+        // nvidia/simready-foundation/sample_content/common_assets/*/.../sm_*.json
+        const metadata: any = {
+          SimReady_Metadata: {
+            asset_type: assetTypeStr,
+            validation: {
+              profile: profile,
+              profile_version: ver,
+            },
           },
-          physics: {
-            rigid_body: true,
-            collision_approximation: 'convexHull',
-            default_density_kg_m3: 1000.0,
-            default_friction_static: 0.5,
-            default_friction_dynamic: 0.5,
-            default_restitution: 0.0,
-          },
-          provenance: {
+          asset_dir: usdzDir,
+          asset_name: stem,
+          asset_type: assetTypeStr,
+          profile: profile,
+          source_file: `@${prompt}@`,           // Phidias's "source" is a text prompt, not a .blend
+          usd_date_generated: isoNow,
+          used_dsrs_exporter: false,            // Phidias is an AI generator, not DSRS
+          // Phidias-specific provenance sub-block (optional extension — does not conflict
+          // with NVIDIA's schema since they don't claim it as closed)
+          phidias_provenance: {
             generator: 'phidias',
             generator_version: process.env.PHIDIAS_VERSION || 'v6',
-            pipeline_stage: 'phidias_generate -> aif_pipeline_input',
+            prompt: prompt,
+            semantic_class_hint: _inferSemanticClass(prompt),
           },
         };
-        fs.writeFileSync(outPath, JSON.stringify(metadata, null, 2));
+        fs.writeFileSync(outPath, JSON.stringify(metadata, null, 4));
 
         const lines = [
-          'aif-pipeline metadata.json generated.',
+          'SimReady-Foundation companion JSON generated.',
           '',
           `File: ${outPath}`,
-          `Asset ID: ${metadata.asset_id}`,
-          `Target profile: ${metadata.target_profile}`,
-          `Dense caption: "${metadata.dense_caption}"`,
+          `Asset name: ${stem}`,
+          `Profile: ${profile} (v${ver})`,
+          `asset_type: ${assetTypeStr}`,
+          `Format: NVIDIA SimReady_Metadata (matches sample_content/common_assets/*/sm_*.json)`,
           '',
-          'Apply downstream via:',
-          `  aif-pipeline metadata apply ${outPath} --output <layer.usda>`,
+          'Note: aif-pipeline metadata apply compatibility pending Omniverse Kit verification.',
+          'For Foundation-spec validation use run_aif_validate.',
         ];
         return {
           content: [{ type: 'text' as const, text: lines.join('\n') }],
