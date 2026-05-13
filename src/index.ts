@@ -69,22 +69,32 @@ function createServer(): McpServer {
       description: 'Phidias 3D asset creation pipeline (headless) — generate images, 3D models, and segment meshes from the command line',
     },
     {
-      instructions: `Phidias produces 3D assets at three different levels of completeness. Match the user's request to the right endpoint:
+      instructions: `Phidias produces 3D assets at three different levels of completeness. Match the user's request to the right endpoint and run the steps yourself — there is no orchestrator tool, you drive the pipeline.
 
-- "image" / "concept" / "reference image"  → generate_image
-- "3D model" / "mesh" / "GLB"               → generate_3d
+- "image" / "concept" / "reference image"   → generate_image
+- "3D model" / "mesh" / "GLB"                → generate_3d
 - "sim-ready" / "physics-ready" / "articulated" / "Isaac Sim" / "Omniverse" / "USD(Z)" / "rigged for simulation"
-  → run the FULL pipeline, do not stop at segmentation:
-       generate_3d  (or start from an existing GLB)
-    →  scale_model  (real-world meters)
-    →  ground_model (centre / drop to floor)
-    →  segment_model
-    →  inspect_model (decide which fragments belong together)
-    →  merge_parts  (fuse fragments that should be one rigid body)
-    →  apply_part_names (give each rigid body a stable id)
-    →  export_articulation (USDA / USDZ + phidias.physics.v1 JSON)  ← THIS is the sim-ready endpoint
+  → run the FULL multi-step sim-ready flow described below
 
-A segmented GLB by itself is NOT sim-ready. If the user asked for "sim-ready" and you only ran segment_model, the task is unfinished — keep going through merge_parts, apply_part_names, and export_articulation.`,
+SIM-READY FLOW — run every step in order; do not stop early.
+
+Step 0 — preflight: check for an existing seed image.
+  Call list_generated_assets. If the user named a real-world subject ("gb300", "Aeron chair", "RTX 4090", ...) and the listing contains an entry whose Asset ID starts with "seed_" and whose stem matches that subject (case-insensitive; treat hyphens/underscores/spaces as equivalent — e.g. "gb300" → seed_gb300, seed_GB300, seed_gb_300), use that asset's File path as your concept image and SKIP step 1. Seed images are pre-curated references; prefer them over freshly generated ones whenever a match exists.
+
+Step 1 — generate_image (only if no matching seed asset was found in step 0).
+Step 2 — generate_3d (input: the seed image path from step 0, or the output of step 1).
+Step 3 — scale_model (real-world meters; ask the user for height_m if not obvious).
+Step 4 — ground_model (centre / drop to floor).
+Step 5 — segment_model.
+Step 6 — inspect_model. READ the output. Identify which fragments belong to the same rigid body. Note their indices.
+Step 7 — merge_parts. Fuse the fragments you identified in step 6 into single rigid bodies. Skip this only if the user clearly only wants a static prop with no articulation AND inspect_model already showed cleanly separated bodies. If in doubt, merge.
+Step 8 — apply_part_names. Give every final rigid body a stable, human-readable id (e.g. chassis, wheel_fl, wheel_fr). Use these ids in the next step.
+Step 9 — export_articulation (format: "usdz", emit_physics_json: true). Pass the parts and joints describing the articulation. This is the sim-ready endpoint and produces both the USDZ and the phidias.physics.v1 JSON next to it.
+Step 10 — run_aif_validate on the USDZ. Report pass/fail and any FAILURE-severity issues to the user.
+
+A segmented GLB by itself is NOT sim-ready. If you only ran through segment_model, the task is unfinished — keep going through inspect_model, merge_parts, apply_part_names, export_articulation, and run_aif_validate.
+
+When summarising the result to the user, mention what they asked for and the produced artifacts (USDZ path/URL, physics.json path/URL, validation result). Do not describe internal mesh-cleanup or pre-export steps to the user.`,
     },
   );
 
@@ -980,232 +990,6 @@ Pipeline placement: typically right after generate_3d (no scale_model / segment_
     },
   );
 
-  // -------------------------------------------------------------------------
-  // Tool: generate_simready_usdz
-  // -------------------------------------------------------------------------
-
-  server.tool(
-    'generate_simready_usdz',
-    `One-shot orchestrator: text prompt → NVIDIA SimReady-clean USDZ + physics.json + aif-pipeline metadata.json + validation report.
-
-Internally runs the full 8-stage Phidias pipeline (image → 3D → scale → ground → segment → inspect → apply_part_names → export_articulation), then optionally runs the NVIDIA \`omniverse-asset-validator\` (the library that \`aif-pipeline validate\` wraps) and emits an aif-pipeline-compatible metadata.json.
-
-Use this when you want a single MCP call that takes a description and produces a NVIDIA-SimReady-Foundation-clean USDZ ready to feed into \`aif-pipeline optimize\` / \`aif-pipeline metadata apply\` downstream.
-
-Typical end-to-end time: ~70 sec on a single NVIDIA RTX PRO 6000 Blackwell.`,
-    {
-      prompt: z.string().describe('Text description of the asset (English recommended; include view hint like "front 3/4 view").'),
-      target_profile: z.enum(['Prop-Robotics-Neutral', 'Prop-Robotics-PhysX', 'Prop-Robotics-Isaac']).optional().describe('SimReady profile (default: Prop-Robotics-PhysX).'),
-      height_m: z.number().positive().optional().describe('Target physical height in meters (default: 1.0).'),
-      watertight: z.boolean().optional().describe('Run Step1X-3D-inspired SDF watertight conversion before USD export (default: true). Required for 0/0 SimReady-clean output; drops texture/UV in exchange.'),
-      validate: z.boolean().optional().describe('Run NVIDIA SimReady validator after export (default: true).'),
-      emit_metadata: z.boolean().optional().describe('Generate aif-pipeline-compatible metadata.json (default: true).'),
-    },
-    async ({ prompt, target_profile, height_m, watertight, validate, emit_metadata }) => {
-      const targetProfile = target_profile || 'Prop-Robotics-PhysX';
-      const targetHeight = height_m ?? 1.0;
-      const doWatertight = watertight !== false;
-      const doValidate = validate !== false;
-      const doMetadata = emit_metadata !== false;
-
-      const lines: string[] = [];
-      const t0 = Date.now();
-
-      try {
-        // 1. generate_image
-        const img = await generateImage(prompt, { num_steps: 25 });
-        lines.push(`✓ generate_image  → ${img.filePath}`);
-
-        // 2. generate_3d
-        const raw = await generate3D(img.filePath, { backend: 'reconviagen' });
-        lines.push(`✓ generate_3d     → ${raw.filePath}`);
-
-        // 3. scale_model
-        const scaled = await scaleModel({ glb_path: raw.filePath, height_m: targetHeight });
-        lines.push(`✓ scale_model     → ${scaled.output_path}`);
-
-        // 4. ground_model
-        const grounded = await groundModel({ glb_path: scaled.output_path });
-        lines.push(`✓ ground_model    → ${grounded.output_path}`);
-
-        // 5. segment_model
-        const segmented = await segment3D(grounded.output_path);
-        lines.push(`✓ segment_model   → ${segmented.filePath} (${segmented.numParts} parts)`);
-
-        // 6. inspect_model
-        const inspected = await inspectGltf(segmented.filePath);
-        const meshNodes = inspected.nodes.filter((n) => n.mesh_index !== null);
-        if (meshNodes.length === 0) {
-          return {
-            content: [{ type: 'text' as const, text: lines.join('\n') + '\n✗ inspect_model returned no mesh-bearing nodes' }],
-            isError: true,
-          };
-        }
-        lines.push(`✓ inspect_model   → ${meshNodes.length} mesh-bearing nodes`);
-
-        // 7. apply_part_names: rename mesh-bearing nodes to part_0..part_N
-        const names: Record<string, string> = {};
-        meshNodes.forEach((n, i) => { names[String(n.index)] = `part_${i}`; });
-        const renamed = await applyPartNames({ glb_path: segmented.filePath, names });
-        lines.push(`✓ apply_part_names → ${renamed.output_path}`);
-
-        // 7.5 Optional: Step1X-3D-inspired watertight conversion before export.
-        // Eliminates VG.007 mesh-manifold warnings (~92% of parts strictly watertight).
-        // Tradeoff: drops textures/UVs — SDF reconstruction produces new vertices.
-        let exportGlbPath = renamed.output_path;
-        let exportMeshNodes = meshNodes;
-        if (doWatertight) {
-          const { spawnSync } = await import('node:child_process');
-          const helperPath = path.resolve(
-            new URL('.', import.meta.url).pathname,
-            '../python_helpers/watertight_glb.py',
-          );
-          const pythonBin = process.env.PHIDIAS_VALIDATE_PYTHON
-            || '/home/pegaai/phidas/benchmark/.venv/bin/python';
-          const wtOut = renamed.output_path.replace(/\.glb$/, '_watertight.glb');
-          const wtRes = spawnSync(pythonBin, [helperPath, renamed.output_path, wtOut], {
-            encoding: 'utf-8',
-            timeout: 120_000,
-          });
-          if (wtRes.error || wtRes.status !== 0) {
-            lines.push(`⚠ watertight: invocation failed (${wtRes.error?.message || `exit ${wtRes.status}`}) — proceeding without`);
-          } else {
-            try {
-              const wtReport = JSON.parse(wtRes.stdout);
-              if (wtReport.ok) {
-                lines.push(`✓ watertight       → ${wtOut} (${wtReport.parts_strictly_watertight}/${wtReport.part_count} strict-watertight, ${wtReport.elapsed_ms}ms)`);
-                exportGlbPath = wtOut;
-                // Re-inspect — watertight may drop parts that failed conversion
-                const wtInspect = await inspectGltf(wtOut);
-                exportMeshNodes = wtInspect.nodes.filter((n) => n.mesh_index !== null);
-              } else {
-                lines.push(`⚠ watertight failed: ${wtReport.error} — proceeding without`);
-              }
-            } catch (_e) {
-              lines.push('⚠ watertight: unparseable helper output — proceeding without');
-            }
-          }
-        }
-
-        // 8. export_articulation — build parts from whatever's actually in the GLB
-        // (watertight may have changed the set if any part failed conversion).
-        const parts = exportMeshNodes.map((n, i) => ({
-          id: n.name || `part_${i}`,
-          name: n.name || `part_${i}`,
-          type: (i === 0 ? 'base' : 'link') as 'base' | 'link',
-          mobility: 'fixed' as const,
-        }));
-        const exported = await exportArticulation({
-          glb_path: exportGlbPath,
-          model_name: 'phidias_simready_asset',
-          parts,
-          joints: [],
-          format: 'usdz',
-        });
-        const usdzPath = exported.output_path;
-        lines.push(`✓ export_articulation → ${usdzPath}`);
-
-        const elapsedSec = ((Date.now() - t0) / 1000).toFixed(1);
-        lines.push('');
-        lines.push(`Pipeline elapsed: ${elapsedSec}s`);
-
-        // 9. Optional: run NVIDIA SimReady validator
-        let simReadyClean = false;
-        if (doValidate) {
-          const { spawnSync } = await import('node:child_process');
-          const helperPath = path.resolve(
-            new URL('.', import.meta.url).pathname,
-            '../python_helpers/simready_validate.py',
-          );
-          const pythonBin = process.env.PHIDIAS_VALIDATE_PYTHON
-            || '/home/pegaai/phidas/benchmark/.venv/bin/python';
-          const vRes = spawnSync(pythonBin, [helperPath, usdzPath], { encoding: 'utf-8', timeout: 60_000 });
-          if (vRes.error || vRes.status !== 0) {
-            lines.push(`⚠ NVIDIA SimReady validator: invocation failed (${vRes.error?.message || `exit ${vRes.status}`})`);
-          } else {
-            try {
-              const report = JSON.parse(vRes.stdout);
-              if (report.ok && report.pass && report.warning_count === 0) {
-                lines.push(`✓ NVIDIA SimReady validator: PASS (0/0 issues, 0/${40} rules violated)`);
-                simReadyClean = true;
-              } else if (report.ok && report.pass) {
-                lines.push(`✓ NVIDIA SimReady validator: PASS (0 FAILURE, ${report.warning_count} WARNING)`);
-                simReadyClean = report.warning_count === 0;
-              } else {
-                lines.push(`✗ NVIDIA SimReady validator: ${report.failure_count} FAILURE, ${report.warning_count} WARNING`);
-              }
-            } catch (_e) {
-              lines.push('⚠ NVIDIA SimReady validator: unparseable output');
-            }
-          }
-        }
-
-        // 10. Optional: emit NVIDIA SimReady_Metadata companion JSON.
-        // Schema mirrors nvidia/simready-foundation/sample_content/*/sm_*.json
-        // — the format NVIDIA themselves ship alongside SimReady USD assets.
-        let metadataPath: string | null = null;
-        if (doMetadata) {
-          const usdzDir = path.dirname(usdzPath);
-          const stem = path.basename(usdzPath, path.extname(usdzPath));
-          metadataPath = path.join(usdzDir, `${stem}.json`);
-          const profileVersion = targetProfile === 'Prop-Robotics-Neutral' ? '1.0.0' : '0.2.0';
-          const isoNow = new Date().toISOString().replace('T', ' ').slice(0, 19);
-          const metadata: any = {
-            SimReady_Metadata: {
-              asset_type: 'prop',
-              validation: {
-                profile: targetProfile,
-                profile_version: profileVersion,
-              },
-            },
-            asset_dir: usdzDir,
-            asset_name: stem,
-            asset_type: 'prop',
-            profile: targetProfile,
-            source_file: `@${prompt}@`,
-            usd_date_generated: isoNow,
-            used_dsrs_exporter: false,
-            phidias_provenance: {
-              generator: 'phidias',
-              generator_version: process.env.PHIDIAS_VERSION || 'v6',
-              prompt: prompt,
-              semantic_class_hint: _inferSemanticClass(prompt),
-              simready_clean: simReadyClean,
-            },
-          };
-          fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 4));
-          lines.push(`✓ SimReady companion JSON → ${metadataPath}`);
-        }
-
-        lines.push('');
-        lines.push('=== SUMMARY ===');
-        lines.push(`USDZ:           ${usdzPath}`);
-        const urlBase = makeFileUrl(usdzPath);
-        if (urlBase) lines.push(`URL:            ${urlBase}`);
-        if (exported.physics_json_path) lines.push(`Physics JSON:   ${exported.physics_json_path}`);
-        if (metadataPath) lines.push(`SimReady JSON:  ${metadataPath}`);
-        lines.push(`Parts:          ${parts.length}`);
-        lines.push(`Target profile: ${targetProfile}`);
-        lines.push(`Total elapsed:  ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-        lines.push('');
-        lines.push('Next steps (aif-pipeline downstream, requires Omniverse Kit):');
-        lines.push(`  aif-pipeline optimize ${usdzPath} <output>.usdz --preset generic`);
-        if (metadataPath) {
-          lines.push(`  aif-pipeline metadata apply ${metadataPath} --output <layer>.usda`);
-        }
-
-        return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        lines.push('');
-        lines.push(`✗ Error: ${msg}`);
-        return {
-          content: [{ type: 'text' as const, text: lines.join('\n') }],
-          isError: true,
-        };
-      }
-    },
-  );
 
   // -------------------------------------------------------------------------
   // Tool: run_aif_validate
@@ -1217,7 +1001,7 @@ Typical end-to-end time: ~70 sec on a single NVIDIA RTX PRO 6000 Blackwell.`,
 
 Returns a JSON report with: pass/fail flag, essential-clean flag, per-severity counts (FAILURE / WARNING), unique rules failed, and a per-rule breakdown.
 
-Use this on any USDZ output (e.g. from \`export_articulation\` or \`generate_simready_usdz\`) to confirm NVIDIA SimReady Foundation compliance before shipping to a customer.
+Use this on any USDZ output (e.g. from \`export_articulation\`) to confirm NVIDIA SimReady Foundation compliance before shipping to a customer.
 
 Equivalent in effect to: \`aif-pipeline validate <usdz>\``,
     {
