@@ -350,37 +350,84 @@ NOTE: Segmentation alone is NOT sim-ready. If the user asked for "sim-ready" / "
 
   server.tool(
     'inspect_model',
-    `Inspect the structure of a GLB/glTF file and return it as JSON. Reports every node's world-space bounding box, centroid, size, face count, mesh/material indices, and parent/child relationships, plus scene-level totals and material base colors.
+    `Inspect a GLB/glTF and return one compact JSON row per mesh-bearing node: index, name, mesh_index, world_centroid (xyz, meters, 2dp), world_size (xyz, meters, 2dp), face_count, plus parent_index / children_indices when the scene is hierarchical.
 
-Use this BEFORE trying to rename or regroup segmented parts. Spatial clues (centroid position, bbox size, which nodes share a parent) often let you name most parts from structure alone — e.g., the node with the largest Y-extent is probably the frame, the many small thin nodes stacked along Y are rack units, etc.
+Use BEFORE renaming or regrouping segmented parts. Node indices are stable across calls on the same file, and can be passed directly to apply_part_names / merge_parts.
 
-No rendering is performed; this is pure scene-graph introspection and returns quickly. Node indices reported here are stable and can be passed to apply_part_names to rename / regroup nodes.`,
+How to use the output efficiently: read the JSON, decide the index→name map (or merge clusters), then call the next tool. Do NOT echo each node's coordinates back in your reasoning — the centroid + size are already in context, citing them again wastes tokens. Just emit the decision.`,
     {
       glb_path: z.string().describe('Absolute path to a GLB (or glTF) file to inspect.'),
-      max_nodes: z.number().int().min(1).max(10000).optional().describe('If the file has more nodes than this, the response truncates the `nodes` array to save context. Default: 500.'),
+      max_nodes: z.number().int().min(1).max(10000).optional().describe('Truncate `nodes` to this many entries to save context. Default: 150.'),
+      include_materials: z.boolean().optional().describe('Include the `materials` array (index, name, base_color_rgba). Default false — most naming / merging decisions do not need material info.'),
+      include_empty_groups: z.boolean().optional().describe('Include nodes that have no mesh (pure scene-graph group nodes). Default false — only mesh-bearing nodes can be renamed or merged meaningfully.'),
     },
-    async ({ glb_path, max_nodes }) => {
+    async ({ glb_path, max_nodes, include_materials, include_empty_groups }) => {
       try {
         const result = await inspectGltf(glb_path);
-        const limit = max_nodes ?? 500;
-        const truncated = result.nodes.length > limit;
-        const payload = truncated
-          ? {
-              ...result,
-              nodes: result.nodes.slice(0, limit),
-              _truncated: {
-                shown: limit,
-                total: result.nodes.length,
-                note: `Response truncated to the first ${limit} nodes. Pass max_nodes to see more.`,
-              },
-            }
-          : result;
+        const limit = max_nodes ?? 150;
+
+        const candidateNodes = include_empty_groups
+          ? result.nodes
+          : result.nodes.filter((n) => n.mesh_index !== null);
+
+        const sceneIsFlat =
+          candidateNodes.every((n) => n.parent_index === null) &&
+          candidateNodes.every((n) => n.children_indices.length === 0);
+
+        const truncated = candidateNodes.length > limit;
+        const shownNodes = truncated ? candidateNodes.slice(0, limit) : candidateNodes;
+
+        const compactNodes = shownNodes.map((n) => {
+          const out: Record<string, unknown> = {
+            i: n.index,
+            name: n.name,
+            mesh: n.mesh_index,
+            c: n.world_centroid,
+            s: n.world_size,
+            faces: n.face_count,
+          };
+          if (!sceneIsFlat) {
+            out.parent = n.parent_index;
+            if (n.children_indices.length > 0) out.children = n.children_indices;
+          }
+          return out;
+        });
+
+        const payload: Record<string, unknown> = {
+          scene: {
+            num_nodes: result.scene.num_nodes,
+            num_meshes: result.scene.num_meshes,
+            num_materials: result.scene.num_materials,
+            overall_size: result.scene.overall_size,
+          },
+          legend: {
+            i: 'node index (stable, pass to apply_part_names / merge_parts)',
+            c: 'world_centroid [x,y,z] meters',
+            s: 'world_size [x,y,z] meters',
+            mesh: 'mesh index, null if pure group node',
+          },
+          nodes: compactNodes,
+        };
+        if (include_materials) payload.materials = result.materials;
+        if (truncated) {
+          payload._truncated = {
+            shown: limit,
+            total: candidateNodes.length,
+            note: `Response truncated to ${limit} ${include_empty_groups ? 'nodes' : 'mesh-bearing nodes'}. Pass max_nodes to see more.`,
+          };
+        }
+        if (!include_empty_groups && result.nodes.length !== candidateNodes.length) {
+          payload._filtered = {
+            empty_group_nodes_hidden: result.nodes.length - candidateNodes.length,
+            note: 'Group / transform nodes with no mesh are hidden. Pass include_empty_groups=true to see them.',
+          };
+        }
 
         return {
           content: [
             {
               type: 'text' as const,
-              text: JSON.stringify(payload, null, 2),
+              text: JSON.stringify(payload),
             },
           ],
         };
@@ -402,11 +449,11 @@ No rendering is performed; this is pure scene-graph introspection and returns qu
     'apply_part_names',
     `Rename nodes and/or wrap groups of nodes under new parent nodes in a GLB, producing a NEW file (the source is never modified).
 
-Node indices match the order returned by inspect_model. Call inspect_model first to see what indices exist, decide names / groupings from spatial structure, then call this tool once with the resulting map.
+Node indices match the order returned by inspect_model. Call inspect_model first, then call this tool once with the resulting map. **Emit the index→name map directly — do not re-cite each node's centroid / bbox / size in your reasoning before calling; the inspect_model output is already in context.**
 
 Grouping: each entry in \`groups\` creates a new parent node with the given name and moves the listed members to become its children. If all members share the same original parent, the new group is attached there; otherwise it is attached to the scene root and a warning is emitted. A node can belong to only one group per call.
 
-IMPORTANT: \`groups\` only reparents nodes — the group node itself has NO mesh geometry. If the eventual goal is export_articulation (physics), do NOT use \`groups\` to produce a part: the empty group node is dropped by the physics JSON pipeline and the resulting articulation will be broken. Use \`merge_parts\` instead to fuse fragments into a single real mesh, then name that merged node with this tool. Use \`groups\` only for scene-graph organisation that is purely cosmetic.
+IMPORTANT: \`groups\` only reparents nodes — the group node itself has NO mesh geometry. If the eventual goal is export_articulation (physics), do NOT use \`groups\` to produce a part: the empty group node is dropped by the physics JSON pipeline and the resulting articulation will be broken. Use \`merge_parts\` instead to fuse fragments into a single real mesh, then name that merged node with this tool. Use \`groups\` only for purely cosmetic scene-graph organisation.
 
 Returns the output GLB path + URL and an asset_id that can be passed to download_asset.`,
     {
@@ -470,20 +517,15 @@ Returns the output GLB path + URL and an asset_id that can be passed to download
 
   server.tool(
     'merge_parts',
-    `Physically fuse a set of GLB nodes into a single node (geometry-level merge). Use this to clean up over-segmented models — e.g., when segment_model produces many tiny fragments that should be one part.
+    `Physically fuse a set of GLB nodes into a single node (geometry-level merge). Use this to clean up over-segmented models — e.g. when segment_model produces many tiny fragments that should be one rigid body.
 
-How it differs from apply_part_names groups: apply_part_names only reparents nodes (they remain selectable separately); merge_parts combines vertex buffers so the merged result is truly one mesh. Original member nodes are removed.
+How it differs from \`apply_part_names\` groups: groups only reparents nodes (they remain selectable separately); merge_parts combines vertex buffers so the result is truly one mesh and the originals are removed.
 
-Semantics:
-- Node indices match inspect_model's order.
-- Each member's geometry is transformed to world space, then combined.
-- Members with different materials stay valid: the merged mesh carries one primitive per material.
-- A node can appear in at most one merge per call.
-- The new node has an identity transform (vertex data is baked in world space).
-- The new node is attached to the members' common original parent when they share one; otherwise to the scene root (warning emitted).
-- Members without a mesh are skipped.
+Constraints to know when picking members: node indices match inspect_model; each node may appear in at most one merge per call; nodes without a mesh are skipped.
 
-Call inspect_model first to see indices, then decide which clusters to merge. Typically follows this pattern: segment_model → inspect_model → merge_parts → inspect_model again → apply_part_names.`,
+Typical pattern: segment_model → inspect_model → merge_parts → inspect_model again → apply_part_names.
+
+**Emit the merge spec directly — do not re-cite each candidate node's centroid / size in your reasoning before calling; the inspect_model output is already in context.**`,
     {
       glb_path: z.string().describe('Absolute path to the source GLB.'),
       merges: z

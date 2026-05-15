@@ -38,7 +38,7 @@ export interface InspectResult {
   materials: InspectedMaterial[];
 }
 
-function round(n: number, digits = 4): number {
+function round(n: number, digits = 2): number {
   const f = 10 ** digits;
   return Math.round(n * f) / f;
 }
