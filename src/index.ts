@@ -38,6 +38,7 @@ import { uploadImage, uploadImageFromUrl, saveImageBuffer } from './upload-image
 import { serveFileIfMatch } from './file-serving.js';
 import { buildPublicUrlBase, requestContext, makeFileUrl } from './request-context.js';
 import { sessionBus, type SessionEvent } from './event-bus.js';
+import { getActiveImage, setActiveImage, clearActiveImage } from './session-state.js';
 
 // ---------------------------------------------------------------------------
 // Server factory — each HTTP request in stateless mode gets a fresh server,
@@ -261,9 +262,11 @@ The URL must be reachable from the MCP server. Common sources: presigned cloud-s
 
 PREFLIGHT — check seed assets first. If the user named a specific real-world subject (e.g. "make a gb300 3D model"), call list_generated_assets BEFORE you have an image path and look for an entry whose Asset ID starts with "seed_" and whose stem matches the subject. Match case-insensitively and treat hyphens/underscores/spaces as equivalent (e.g. "gb300" matches seed_gb300, seed_GB300, seed_gb_300). If a seed image matches, pass its File path here directly — do NOT call generate_image first. Only fall through to generate_image when no seed matches and the user did not provide a path.
 
+ACTIVE IMAGE FALLBACK — when the Phidias frontend has an image loaded in the model tab, it publishes that image as the session's active image. If the caller omits image_path, the tool uses the active image automatically. Prefer omitting image_path when the user clearly means "this image" / "the one I just uploaded" — no need to ask for the path.
+
 NOTE: This produces a single mesh, NOT a sim-ready asset. If the user asked for "sim-ready" / "physics-ready" / "articulated" / "Isaac Sim" / "USDZ for simulation", you must continue: scale_model → ground_model → segment_model → inspect_model → merge_parts → apply_part_names → export_articulation.`,
     {
-      image_path: z.string().describe('Absolute file path to the reference image (PNG/JPG). Can be a path from generate_image output or any local image file.'),
+      image_path: z.string().optional().describe('Absolute file path to the reference image (PNG/JPG). Optional — when omitted, falls back to the active image published by the Phidias frontend. Provide explicitly when working from a specific seed asset or a freshly-generated image.'),
       seed: z.number().int().optional().describe('Random seed for reproducibility. Omit for random results.'),
       texture_size: z.number().int().optional().describe('Texture resolution (default: 1024). Options: 512, 1024, 2048. Higher = more detailed textures but larger file.'),
       ss_guidance_strength: z.number().optional().describe('Structure guidance strength (default: 7.5). Controls how closely the 3D shape follows the image.'),
@@ -273,7 +276,19 @@ NOTE: This produces a single mesh, NOT a sim-ready asset. If the user asked for 
     },
     async (params) => {
       try {
-        const asset = await generate3D(params.image_path, {
+        const activeImage = getActiveImage();
+        const imagePath = params.image_path ?? activeImage?.filePath;
+        if (!imagePath) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: 'No image_path provided and no active image is set on the Phidias frontend. Either pass image_path explicitly, or have the user select an image in the model tab first.',
+            }],
+            isError: true,
+          };
+        }
+
+        const asset = await generate3D(imagePath, {
           backend: 'reconviagen',
           seed: params.seed,
           texture_size: params.texture_size,
@@ -1422,12 +1437,103 @@ async function startHttp(port: number, host: string, token: string | undefined):
       return;
     }
 
+    // ─── Frontend-pushed session state ───────────────────────────────────
+    // GET → snapshot of current state. POST → update activeImage (or
+    // clear it with `{ activeImage: null }`). Used by the Phidias UI to
+    // tell tools like generate_3d which image the user is currently
+    // looking at, so the agent doesn't have to repeat the path.
+    if (req.url && (req.url === '/api/state' || req.url.startsWith('/api/state?'))) {
+      if (!authorize(req, res, token)) return;
+
+      if (req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json', ...CORS_HEADERS });
+        res.end(JSON.stringify({ activeImage: getActiveImage() }));
+        return;
+      }
+
+      if (req.method === 'POST') {
+        const MAX_JSON_BYTES = 64 * 1024;
+        const chunks: Buffer[] = [];
+        let received = 0;
+        let aborted = false;
+
+        req.on('data', (chunk: Buffer) => {
+          if (aborted) return;
+          received += chunk.length;
+          if (received > MAX_JSON_BYTES) {
+            aborted = true;
+            res.writeHead(413, { 'Content-Type': 'application/json', ...CORS_HEADERS });
+            res.end(JSON.stringify({ error: `payload too large (limit ${MAX_JSON_BYTES})` }));
+            req.destroy();
+            return;
+          }
+          chunks.push(chunk);
+        });
+
+        req.on('end', () => {
+          if (aborted) return;
+          let body: { activeImage?: { assetId?: string } | null };
+          try {
+            body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            res.writeHead(400, { 'Content-Type': 'application/json', ...CORS_HEADERS });
+            res.end(JSON.stringify({ error: `invalid json: ${msg}` }));
+            return;
+          }
+
+          if (body.activeImage === null) {
+            clearActiveImage();
+            res.writeHead(200, { 'Content-Type': 'application/json', ...CORS_HEADERS });
+            res.end(JSON.stringify({ activeImage: null }));
+            return;
+          }
+
+          const assetId = body.activeImage?.assetId;
+          if (!assetId || typeof assetId !== 'string') {
+            res.writeHead(400, { 'Content-Type': 'application/json', ...CORS_HEADERS });
+            res.end(JSON.stringify({ error: 'activeImage.assetId is required (string) or pass activeImage: null to clear' }));
+            return;
+          }
+
+          const asset = findAssetById(assetId);
+          if (!asset) {
+            res.writeHead(404, { 'Content-Type': 'application/json', ...CORS_HEADERS });
+            res.end(JSON.stringify({ error: `asset not found: ${assetId}` }));
+            return;
+          }
+          if (asset.type !== 'image') {
+            res.writeHead(400, { 'Content-Type': 'application/json', ...CORS_HEADERS });
+            res.end(JSON.stringify({ error: `asset ${assetId} is not an image (type=${asset.type})` }));
+            return;
+          }
+
+          setActiveImage(asset);
+          res.writeHead(200, { 'Content-Type': 'application/json', ...CORS_HEADERS });
+          res.end(JSON.stringify({ activeImage: getActiveImage() }));
+        });
+
+        req.on('error', () => {
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json', ...CORS_HEADERS });
+            res.end(JSON.stringify({ error: 'request stream error' }));
+          }
+        });
+
+        return;
+      }
+
+      res.writeHead(405, { 'Content-Type': 'application/json', ...CORS_HEADERS, Allow: 'GET, POST, OPTIONS' });
+      res.end(JSON.stringify({ error: 'method not allowed' }));
+      return;
+    }
+
     // File retrieval (same auth posture as /mcp)
     if (serveFileIfMatch(req, res, token)) return;
 
     if (!req.url || !req.url.startsWith('/mcp')) {
       res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end('Not found. MCP endpoint is at /mcp, files at /files/<name>, live stream at /api/events/stream, upload at POST /api/upload');
+      res.end('Not found. MCP endpoint is at /mcp, files at /files/<name>, live stream at /api/events/stream, upload at POST /api/upload, frontend state at GET/POST /api/state');
       return;
     }
 
